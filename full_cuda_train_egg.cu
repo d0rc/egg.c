@@ -26,6 +26,7 @@
 #define MAX_STRIDE 8 
 
 // --- Seed Offsets for RNG Consistency ---
+#define SEED_OFF_EMB 0
 #define SEED_OFF_GRU_M1 1
 #define SEED_OFF_GRU_M2 2
 #define SEED_OFF_GRU_M3 3
@@ -97,7 +98,9 @@ void init_model(EggModel *model) {
     EggModel *temp = (EggModel*)malloc(sizeof(EggModel)); 
     if (!temp) { printf("Failed to allocate temp model\n"); exit(1); }
 
-    for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) model->embedding[i] = gen_noise_host(&rng);
+    // Embedding: transpose to column-major for coalesced GPU access
+    for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) temp->embedding[i] = gen_noise_host(&rng);
+    transpose_matrix(model->embedding, temp->embedding, VOCAB_SIZE, HIDDEN_DIM);
 
     for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) temp->head[i] = gen_noise_host(&rng);
     transpose_matrix(model->head, temp->head, VOCAB_SIZE, HIDDEN_DIM);
@@ -202,8 +205,8 @@ __global__ void generate_sequence_kernel(
     for(int t=0; t < total_len; t++) {
         if (t < seed_len) current_token = seed_text[t];
         
-        // 1. Embed
-        KERNEL_LOOP(i, HIDDEN_DIM) s_ptr[i] = model->embedding[current_token * HIDDEN_DIM + i];
+        // 1. Embed (column-major access: feature * VOCAB_SIZE + token)
+        KERNEL_LOOP(i, HIDDEN_DIM) s_ptr[i] = model->embedding[i * VOCAB_SIZE + current_token];
         __syncthreads();
         
         // 2. Layers
@@ -429,8 +432,16 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
         
         uint8_t input_token = dataset[stream_pos + t];
         
+        // Embed with rank-1 perturbation (column-major access)
+        uint32_t seed_emb = (step_seed + pair_idx) + SEED_OFF_EMB;
+        int8_t a_token = noise_from_hash(seed_emb, input_token);  // A[token] scalar
+        
         for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
-            my_s_ptr[i] = model->embedding[input_token * HIDDEN_DIM + i];
+            int8_t base = model->embedding[i * VOCAB_SIZE + input_token];
+            int8_t b_val = noise_from_hash(seed_emb + HIDDEN_DIM, i);
+            
+            long long perturb = ((long long)a_token * b_val * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+            my_s_ptr[i] = clip((long long)base + perturb);
         }
         __syncwarp();
         
@@ -884,6 +895,16 @@ int main() {
             (int8_t*)d_model + off_head, VOCAB_SIZE, HIDDEN_DIM, 
             0, VOCAB_SIZE, 
             SEED_OFF_HEAD, d_fitnesses, seed
+        );
+        
+        // Update embedding (column-major: rows=HIDDEN_DIM, cols=VOCAB_SIZE)
+        // Forward uses: A indexed by token (col), B indexed by feature (row)
+        // So offset_A maps to col (token), offset_B maps to row (feature)
+        long off_emb = offsetof(EggModel, embedding);
+        update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM + 511)/512, 512 >>>(
+            (int8_t*)d_model + off_emb, HIDDEN_DIM, VOCAB_SIZE, 
+            HIDDEN_DIM, 0,  // Swapped: offset_A=HIDDEN_DIM (for B/feature), offset_B=0 (for A/token)
+            SEED_OFF_EMB, d_fitnesses, seed
         );
         cudaDeviceSynchronize();
 
