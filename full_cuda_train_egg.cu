@@ -7,17 +7,17 @@
 #include <device_launch_parameters.h>
 
 // --- Configuration ---
-#define SM_CORES 170
+#define SM_CORES 128
 #define VOCAB_SIZE 256
-#define HIDDEN_DIM (SM_CORES * 2)
+#define HIDDEN_DIM (SM_CORES * 1)
 #define N_LAYERS 4
-#define SEQ_LEN 4096
+#define SEQ_LEN 256
 #define BATCH 8 // Streaming batch size per block
-#define POPULATION_SIZE SM_CORES * 4
+#define POPULATION_SIZE SM_CORES * 16 * 4
 #define SHARED_STRIDE (HIDDEN_DIM * 4)
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 4
-#define UPDATE_THRESHOLD 870 * 2.5
+#define UPDATE_THRESHOLD 870 * 40
 #define MAX_VAL 127
 #define MIN_VAL -127
 
@@ -348,7 +348,7 @@ __global__ void generate_sequence_kernel(
             for(int k=0; k<HIDDEN_DIM; k++) {
                 acc += (long long)s_ptr[k] * w_head[k*VOCAB_SIZE + i]; 
             }
-            s_ptr[HIDDEN_DIM + i] = acc >> 8; 
+            s_ptr[HIDDEN_DIM + i] = clip(acc >> 8); 
         }
         __syncthreads();
         
@@ -917,7 +917,8 @@ int main() {
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x9e3779b9);
         int start_idx = step * SEQ_LEN;
         
-        train_sequence_kernel<<<POPULATION_SIZE / BATCH, 256, BATCH * SHARED_STRIDE>>>(
+        size_t shared_mem_size = BATCH * SHARED_STRIDE;
+        train_sequence_kernel<<<POPULATION_SIZE / BATCH, 256, shared_mem_size>>>(
             d_dataset, ds.length, start_idx, d_model, d_pop_states, d_accum_loss, seed
         );
         cudaDeviceSynchronize();
