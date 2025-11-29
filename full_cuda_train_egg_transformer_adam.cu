@@ -67,6 +67,19 @@ void handle_sigint(int sig) {
 #define SEED_OFF_LN_F 900
 #define SEED_OFF_HEAD 999
 
+// ADAM HYPERPARAMS
+float get_learning_rate(long step) {
+    if (step < 30) return 1.0f;
+    if (step < 500) return 0.5f;
+    if (step < 2000) return 0.1f;
+    return 0.05f;
+}
+
+#define ADAM_BETA1 0.8f
+#define ADAM_BETA2 0.999f
+#define ADAM_EPS 1e-8f
+#define ADAM_WEIGHT_DECAY 0.01f
+
 #define CHECK_CUDA(call) { cudaError_t err = call; if (err != cudaSuccess) { printf("CUDA Error: %s:%d\n", cudaGetErrorString(err), __LINE__); exit(1); } }
 
 // --- TYPE ALIASES ---
@@ -93,6 +106,28 @@ typedef struct {
     WeightType head[HIDDEN_DIM * VOCAB_SIZE];
 } TransformerModel;
 
+// Adam State Structures
+typedef struct {
+    float m;
+    float v;
+    float acc; // Fractional accumulator for integer weights
+} AdamParam;
+
+typedef struct {
+    AdamParam embedding[VOCAB_SIZE * HIDDEN_DIM];
+    AdamParam pos_emb[SEQ_LEN * HIDDEN_DIM];
+    AdamParam ln_1[N_LAYERS][HIDDEN_DIM];
+    AdamParam w_q[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
+    AdamParam w_k[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
+    AdamParam w_v[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
+    AdamParam w_o[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
+    AdamParam ln_2[N_LAYERS][HIDDEN_DIM];
+    AdamParam w_up[N_LAYERS][HIDDEN_DIM * (HIDDEN_DIM * 4)];
+    AdamParam w_down[N_LAYERS][(HIDDEN_DIM * 4) * HIDDEN_DIM];
+    AdamParam ln_f[HIDDEN_DIM];
+    AdamParam head[HIDDEN_DIM * VOCAB_SIZE];
+} AdamModel;
+
 ActType *d_kv_cache = NULL;
 
 __constant__ int32_t d_EXP2_TABLE[256];
@@ -101,18 +136,6 @@ __device__ int32_t d_debug_updates[2];
 __device__ unsigned long long d_total_updates;
 
 // --- HOST HELPER ---
-int get_update_threshold(double loss) {
-    if (loss > 6.0) return 100;
-    if (loss > 4.6) return 2000;
-    if (loss > 4.2) return 4000;
-    if (loss > 3.9) return 8000;
-    if (loss > 3.8) return 16000;
-    if (loss > 3.6) return 32000;
-    if (loss > 3.0) return 32000;
-    if (loss > 1.0) return 32000;
-    return 32000; 
-}
-
 double get_time_diff_ms(struct timespec start, struct timespec end) {
     return ((end.tv_sec - start.tv_sec) * 1000.0) + ((end.tv_nsec - start.tv_nsec) / 1e6);
 }
@@ -405,7 +428,19 @@ __global__ void compute_fitness_kernel(const int32_t *accum_loss, int32_t *fitne
     fitnesses[idx] = (p < n) ? 1 : ((n < p) ? -1 : 0);
 }
 
-__global__ void update_matrix_kernel(WeightType *W, int rows, int cols, int off_A, int off_B, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
+// ADAM W Implementation KERNELS
+
+// update_matrix_adam_kernel
+__global__ void update_matrix_adam_kernel(
+    WeightType *W, 
+    AdamParam *adam_state,
+    int rows, int cols, 
+    int off_A, int off_B, 
+    int seed_base, 
+    const int32_t *fitnesses, 
+    uint32_t step_seed,
+    float learning_rate
+) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     __shared__ int s_count;
@@ -414,21 +449,59 @@ __global__ void update_matrix_kernel(WeightType *W, int rows, int cols, int off_
 
     int change = 0;
     if (idx < rows * cols) {
-        // Correct Layout: Row-Major
         int r = idx / cols; 
         int c = idx % cols;
         
+        // Approximate Gradient Computation
         VoteType vote = 0;
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
             uint32_t s = step_seed + p + seed_base;
-            // Correlate noise. A -> Col (Output), B -> Row (Input), based on Forward pass.
             vote += (VoteType)fit * noise_from_hash(s + off_A, c) * noise_from_hash(s + off_B, r);
         }
-        WeightType w = W[idx];
-        if(vote > thres && w < MAX_VAL) { w++; change=1; }
-        else if(vote < -thres && w > MIN_VAL) { w--; change=1; }
+        
+        // Gradient is negative of vote (since vote > 0 suggests moving in that direction improves fitness)
+        // If fitness=1 (positive noise better), we want to go in +noise direction.
+        // vote accumulates +noise. So vote is the step. 
+        // Standard GD: w = w - lr * grad. 
+        // Equiv to: w = w + lr * (-grad).
+        // identifying "vote" as (-grad).
+        
+        float g = -(float)vote; 
+
+        // Load Adam State
+        AdamParam p = adam_state[idx];
+        
+        // Update Moments
+        p.m = ADAM_BETA1 * p.m + (1.0f - ADAM_BETA1) * g;
+        p.v = ADAM_BETA2 * p.v + (1.0f - ADAM_BETA2) * (g * g);
+        
+        // Bias Correction (Simplified: assume simplified or pre-bias-corrected for long steps)
+        // For efficiency in chaotic integer training, often skipped or approximated, 
+        // but let's do standard Bias Correction if we track steps, or just Raw Adam for simplicity 
+        // given the massive noise. Let's stick to raw M/sqrt(V).
+        
+        float m_hat = p.m; // / (1 - beta1^t)
+        float v_hat = p.v; // / (1 - beta2^t)
+        
+        // Update Step
+        float step = - learning_rate * (m_hat / (sqrtf(v_hat) + ADAM_EPS) + ADAM_WEIGHT_DECAY * (float)W[idx]);
+        
+        // Accumulate
+        p.acc += step;
+        
+        // Apply to Integer Weight
+        int8_t w = W[idx];
+        if (p.acc >= 1.0f) {
+            if (w < MAX_VAL) { w++; change=1; p.acc -= 1.0f; }
+            else p.acc = 1.0f; // Clamp accumulator
+        } else if (p.acc <= -1.0f) {
+             if (w > MIN_VAL) { w--; change=1; p.acc += 1.0f; }
+             else p.acc = -1.0f; // Clamp accumulator
+        }
+        
         W[idx] = w;
+        adam_state[idx] = p; // Write back state
     }
 
     if (change) atomicAdd(&s_count, 1);
@@ -437,7 +510,17 @@ __global__ void update_matrix_kernel(WeightType *W, int rows, int cols, int off_
     if (threadIdx.x == 0 && s_count > 0) atomicAdd(&d_total_updates, (unsigned long long)s_count);
 }
 
-__global__ void update_vector_kernel(WeightType *V, int len, int off_A, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
+// update_vector_adam_kernel
+__global__ void update_vector_adam_kernel(
+    WeightType *V, 
+    AdamParam *adam_state,
+    int len, 
+    int off_A, 
+    int seed_base, 
+    const int32_t *fitnesses, 
+    uint32_t step_seed,
+    float learning_rate
+) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     __shared__ int s_count;
@@ -451,10 +534,28 @@ __global__ void update_vector_kernel(WeightType *V, int len, int off_A, int seed
             int fit = fitnesses[p]; if(fit==0) continue;
             vote += (VoteType)fit * noise_from_hash(step_seed + p + seed_base + off_A, idx);
         }
-        WeightType v = V[idx];
-        if(vote > thres && v < MAX_VAL) { v++; change=1; }
-        else if(vote < -thres && v > MIN_VAL) { v--; change=1; }
-        V[idx] = v;
+        
+        float g = -(float)vote;
+        AdamParam p = adam_state[idx];
+        
+        p.m = ADAM_BETA1 * p.m + (1.0f - ADAM_BETA1) * g;
+        p.v = ADAM_BETA2 * p.v + (1.0f - ADAM_BETA2) * (g * g);
+        
+        float step = - learning_rate * (p.m / (sqrtf(p.v) + ADAM_EPS) + ADAM_WEIGHT_DECAY * (float)V[idx]);
+        
+        p.acc += step;
+        
+        int8_t v_val = V[idx];
+        if (p.acc >= 1.0f) {
+            if (v_val < MAX_VAL) { v_val++; change=1; p.acc -= 1.0f; }
+            else p.acc = 1.0f;
+        } else if (p.acc <= -1.0f) {
+            if (v_val > MIN_VAL) { v_val--; change=1; p.acc += 1.0f; }
+            else p.acc = -1.0f;
+        }
+        
+        V[idx] = v_val;
+        adam_state[idx] = p;
     }
 
     if (change) atomicAdd(&s_count, 1);
@@ -678,39 +779,9 @@ int main() {
     init_tables();
     cudaMemcpyToSymbol(d_EXP2_TABLE, h_EXP2_TABLE, 256*sizeof(int32_t));
 
-    // --- CONFIG REPORT ---
-    long long n_params_emb = (long long)VOCAB_SIZE * HIDDEN_DIM;
-    long long n_params_pos = (long long)SEQ_LEN * HIDDEN_DIM;
-    long long n_params_per_layer = (
-        (4LL * HIDDEN_DIM * HIDDEN_DIM) + // Q,K,V,O
-        (2LL * HIDDEN_DIM * (4 * HIDDEN_DIM)) + // Up, Down
-        (2LL * HIDDEN_DIM) // LN1, LN2
-    );
-    long long n_params_layers = (long long)N_LAYERS * n_params_per_layer;
-    long long n_params_head = (long long)HIDDEN_DIM * VOCAB_SIZE;
-    long long n_params_ln_f = HIDDEN_DIM;
-    long long total_params = n_params_emb + n_params_pos + n_params_layers + n_params_head + n_params_ln_f;
-
-    size_t kv_cache_bytes = (size_t)POPULATION_BATCH_SIZE * N_LAYERS * 2 * SEQ_LEN * HIDDEN_DIM;
-    size_t model_bytes = sizeof(TransformerModel);
-    size_t pop_state_bytes = (POPULATION_SIZE * sizeof(int32_t)) + ((POPULATION_SIZE/2) * sizeof(int32_t));
-
-    printf("\n=== EGG TRANSFORMER CONFIGURATION ===\n");
-    printf("Architecture:\n");
-    printf("  Dim: %d | Heads: %d | Layers: %d | Head Dim: %d\n", HIDDEN_DIM, N_HEADS, N_LAYERS, HEAD_DIM);
-    printf("  Seq Len: %d | Vocab: %d\n", SEQ_LEN, VOCAB_SIZE);
-    printf("\nParameters (int8):\n");
-    printf("  Embedding: %lld\n", n_params_emb);
-    printf("  Pos Emb:   %lld\n", n_params_pos);
-    printf("  Layers:    %lld (%d x %lld)\n", n_params_layers, N_LAYERS, n_params_per_layer);
-    printf("  Head:      %lld\n", n_params_head);
-    printf("  TOTAL:     %lld (%.2f M)\n", total_params, total_params / 1000000.0);
-    printf("\nMemory Usage:\n");
-    printf("  KV Cache:   %.2f GB (Pop Batch: %d, Total: %d)\n", kv_cache_bytes / (1024.0*1024*1024), POPULATION_BATCH_SIZE, POPULATION_SIZE);
-    printf("  Model Wgts: %.2f MB\n", model_bytes / (1024.0*1024));
-    printf("  Pop State:  %.2f MB\n", pop_state_bytes / (1024.0*1024));
-    printf("=====================================\n\n");
-    // ---------------------
+    printf("\n=== EGG TRANSFORMER ADAM ===\n");
+    printf("AdamW Config: B1=%.3f B2=%.3f EPS=%.1e WD=%.4f (Dynamic LR)\n", 
+           ADAM_BETA1, ADAM_BETA2, ADAM_EPS, ADAM_WEIGHT_DECAY);
 
     Dataset ds = {0,0};
     FILE *f = fopen("input.txt", "rb");
@@ -728,6 +799,11 @@ int main() {
     TransformerModel *d_model; CHECK_CUDA(cudaMalloc(&d_model, sizeof(TransformerModel)));
     CHECK_CUDA(cudaMemcpy(d_model, h_model, sizeof(TransformerModel), cudaMemcpyHostToDevice));
 
+    // Allocate Adam State (Zero intiialized)
+    AdamModel *d_adam_state; 
+    CHECK_CUDA(cudaMalloc(&d_adam_state, sizeof(AdamModel)));
+    CHECK_CUDA(cudaMemset(d_adam_state, 0, sizeof(AdamModel)));
+
     uint8_t *d_dataset; CHECK_CUDA(cudaMalloc(&d_dataset, ds.length));
     CHECK_CUDA(cudaMemcpy(d_dataset, ds.data, ds.length, cudaMemcpyHostToDevice));
 
@@ -739,7 +815,6 @@ int main() {
     printf("Allocating KV Cache: %.2f GB\n", kv_size / (1024.0*1024*1024));
     CHECK_CUDA(cudaMalloc(&d_kv_cache, kv_size));
 
-    // Get address of global update counter
     unsigned long long *d_updates_ptr;
     CHECK_CUDA(cudaGetSymbolAddress((void**)&d_updates_ptr, d_total_updates));
     
@@ -750,14 +825,13 @@ int main() {
     uint8_t *d_gen_buf; CHECK_CUDA(cudaMalloc(&d_gen_buf, total_gen_len));
     int8_t *d_gen_kv; CHECK_CUDA(cudaMalloc(&d_gen_kv, N_LAYERS * 2 * total_gen_len * HIDDEN_DIM));
 
-    printf("Starting Transformer Training (Pop=%d, Dim=%d)...\n", POPULATION_SIZE, HIDDEN_DIM);
+    printf("Starting Training...\n");
     long max_steps = (ds.length - 1) / SEQ_LEN;
 
     for(long step=0; step<max_steps && keep_running; step++) {
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x12345678);
         
-        // 6KB Shared Mem (2*Hidden + 256 + MLP Buffer)
         size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM); 
         for (int offset = 0; offset < POPULATION_SIZE; offset += POPULATION_BATCH_SIZE) {
             train_sequence_kernel<<<POPULATION_BATCH_SIZE, BLOCK_THREADS, sm_size>>>(
@@ -768,65 +842,62 @@ int main() {
         
         compute_fitness_kernel<<< (POPULATION_SIZE/2 + 255)/256, 256 >>>(d_loss, d_fit, POPULATION_SIZE/2);
         
-        thrust::device_ptr<int32_t> t_loss(d_loss);
-        long long total_loss = thrust::reduce(t_loss, t_loss + POPULATION_SIZE, (long long)0);
-        double avg_loss = (double)total_loss / (POPULATION_SIZE * SEQ_LEN * 16.0); // Normalization factor approx
-        int thres = get_update_threshold(avg_loss);
-
         // Reset update counter
         CHECK_CUDA(cudaMemset(d_updates_ptr, 0, sizeof(unsigned long long)));
 
+        // Adam Updates
+        float current_lr = get_learning_rate(step);
         for(int l=0; l<N_LAYERS; l++) {
             int s_base = l * 1000;
             int d2 = HIDDEN_DIM*HIDDEN_DIM;
             
-            // Layers
-            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base, d_fit, seed, thres);
-            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base, d_fit, seed, thres);
-            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base, d_fit, seed, thres);
-            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base, d_fit, seed, thres);
+            update_matrix_adam_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_q[l], (AdamParam*)d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base, d_fit, seed, current_lr);
+            update_matrix_adam_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_k[l], (AdamParam*)d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base, d_fit, seed, current_lr);
+            update_matrix_adam_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_v[l], (AdamParam*)d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base, d_fit, seed, current_lr);
+            update_matrix_adam_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_o[l], (AdamParam*)d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base, d_fit, seed, current_lr);
             
-            update_matrix_kernel<<< (HIDDEN_DIM*4*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base, d_fit, seed, thres);
-            update_matrix_kernel<<< (4*HIDDEN_DIM*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base, d_fit, seed, thres);
+            update_matrix_adam_kernel<<< (HIDDEN_DIM*4*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_up[l], (AdamParam*)d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base, d_fit, seed, current_lr);
+            update_matrix_adam_kernel<<< (4*HIDDEN_DIM*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_down[l], (AdamParam*)d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base, d_fit, seed, current_lr);
             
-            update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1, s_base, d_fit, seed, thres);
-            update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2, s_base, d_fit, seed, thres);
+            update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_1[l], (AdamParam*)d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1, s_base, d_fit, seed, current_lr);
+            update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_2[l], (AdamParam*)d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2, s_base, d_fit, seed, current_lr);
         }
         
-        update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, d_fit, seed, thres);
-        update_matrix_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512 >>>((WeightType*)d_model->head, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_HEAD, SEED_OFF_HEAD+VOCAB_SIZE, 0, d_fit, seed, thres);
-        update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((WeightType*)d_model->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, thres);
+        update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_f, (AdamParam*)d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, d_fit, seed, current_lr);
+        update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512 >>>((WeightType*)d_model->head, (AdamParam*)d_adam_state->head, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_HEAD, SEED_OFF_HEAD+VOCAB_SIZE, 0, d_fit, seed, current_lr);
+        update_matrix_adam_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((WeightType*)d_model->embedding, (AdamParam*)d_adam_state->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, current_lr);
         
         CHECK_CUDA(cudaDeviceSynchronize());
         clock_gettime(CLOCK_MONOTONIC, &t1);
         
-        // Get update count
         unsigned long long h_updates = 0;
         CHECK_CUDA(cudaMemcpy(&h_updates, d_updates_ptr, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         
         double step_ms = get_time_diff_ms(t0, t1);
         double tokens_per_sec = (double)(POPULATION_SIZE * SEQ_LEN) / (step_ms / 1000.0);
 
-        // Always print step info
-        printf("Step %ld | Loss: %.4f | Time: %.2f ms | Updates: %llu | Speed: %.2f tok/s\n", 
-            step, avg_loss, step_ms, h_updates, tokens_per_sec);
+        thrust::device_ptr<int32_t> t_loss(d_loss);
+        long long total_loss = thrust::reduce(t_loss, t_loss + POPULATION_SIZE, (long long)0);
+        double avg_loss = (double)total_loss / (POPULATION_SIZE * SEQ_LEN * 16.0); 
 
-        // Generate Example every 100 steps
+        printf("Step %ld | Loss: %.4f | Time: %.2f ms | Updates: %llu | Speed: %.2f tok/s | LR: %.3f\n", 
+            step, avg_loss, step_ms, h_updates, tokens_per_sec, current_lr);
+
         if (step % 5 == 0) {
             CHECK_CUDA(cudaMemcpy(d_gen_buf, d_dataset + (step*SEQ_LEN) % (ds.length-SEQ_LEN), gen_seed_len, cudaMemcpyDeviceToDevice));
             generate_sequence_kernel<<<1, BLOCK_THREADS, sm_size>>>(
                 d_gen_buf, gen_seed_len, gen_output_len, d_model, d_gen_kv, seed+999
             );
             CHECK_CUDA(cudaDeviceSynchronize());
-            uint8_t h_buf[256]; // gen_seed_len + gen_output_len < 256
+            uint8_t h_buf[256];
             CHECK_CUDA(cudaMemcpy(h_buf, d_gen_buf, total_gen_len, cudaMemcpyDeviceToHost));
             
             printf("\n--- GENERATION ---\n");
-            printf("\033[32m"); // Green for seed
+            printf("\033[32m"); 
             for(int i=0; i<gen_seed_len; i++) {
                 char c = h_buf[i]; printf("%c", (c>=32 && c<=126) ? c : '.');
             }
-            printf("\033[36m"); // Cyan for gen
+            printf("\033[36m"); 
             for(int i=gen_seed_len; i<total_gen_len; i++) {
                 char c = h_buf[i]; printf("%c", (c>=32 && c<=126) ? c : '.');
             }
@@ -840,5 +911,6 @@ int main() {
 
     free(h_model); free(ds.data);
     cudaFree(d_model); cudaFree(d_dataset); cudaFree(d_loss); cudaFree(d_fit); cudaFree(d_kv_cache);
+    cudaFree(d_adam_state);
     return 0;
 }
