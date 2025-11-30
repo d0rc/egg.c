@@ -27,9 +27,9 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 256
+#define HIDDEN_DIM 384
 #define HEAD_DIM 64
-#define N_LAYERS 12
+#define N_LAYERS 4
 #define SEQ_LEN 128     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
@@ -40,7 +40,7 @@ void handle_sigint(int sig) {
 
 // Population Sizing (Target 20GB)
 #define POPULATION_BATCH_SIZE (8192 * 5)
-#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 10)
+#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 1)
 
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 0
@@ -69,16 +69,13 @@ void handle_sigint(int sig) {
 
 // ADAM HYPERPARAMS
 float get_learning_rate(long step) {
-    if (step < 30) return 1.0f;
-    if (step < 500) return 0.5f;
-    if (step < 2000) return 0.1f;
     return 0.05f;
 }
 
-#define ADAM_BETA1 0.8f
-#define ADAM_BETA2 0.999f
+#define ADAM_BETA1 0.9f
+#define ADAM_BETA2 0.98f
 #define ADAM_EPS 1e-8f
-#define ADAM_WEIGHT_DECAY 0.01f
+#define ADAM_WEIGHT_DECAY 0.001f
 
 #define CHECK_CUDA(call) { cudaError_t err = call; if (err != cudaSuccess) { printf("CUDA Error: %s:%d\n", cudaGetErrorString(err), __LINE__); exit(1); } }
 
@@ -192,7 +189,9 @@ __device__ __forceinline__ AccumType block_reduce_sum_broadcast(AccumType val, B
     AccumType total = BlockReduce(storage).Sum(val);
     if (threadIdx.x == 0) shared_var = total;
     __syncthreads();
-    return shared_var;
+    AccumType ret = shared_var;
+    __syncthreads();
+    return ret;
 }
 
 __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
@@ -307,6 +306,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                  w_v_sum += (AttnAccumType)wt * v_ctx;
                  tot_sc += wt;
                  
+                 __syncthreads();
                  if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0; // Reset
                  __syncthreads();
             }
@@ -651,6 +651,7 @@ __global__ void generate_sequence_kernel(
                 w_v_sum += (AttnAccumType)wt * v_ctx;
                 tot_sc += wt;
                 
+                __syncthreads();
                 if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
                 __syncthreads();
             }
