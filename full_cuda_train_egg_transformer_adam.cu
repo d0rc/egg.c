@@ -27,9 +27,9 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 384
+#define HIDDEN_DIM 256
 #define HEAD_DIM 64
-#define N_LAYERS 4
+#define N_LAYERS 2
 #define SEQ_LEN 128     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
@@ -47,6 +47,14 @@ void handle_sigint(int sig) {
 #define SIGMA_SHIFT_VECTOR 2
 #define MAX_VAL 127
 #define MIN_VAL -127
+
+// Softmax Configuration - Extended to 256 entries to match legacy range
+#define SOFTMAX_SCALE_BIT 20
+#define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)  // 1,048,576
+#define SOFTMAX_LUT_SIZE 256
+// Scaling factor: legacy used 2^(i/16), we use exp(-i/K) where K = 16/ln(2) ≈ 23.08
+// This makes exp(-i/23.08) ≈ 2^(-i/16), matching the legacy curve shape
+#define SOFTMAX_EXP_SCALE 23.08
 
 #define SEED_OFF_EMB 0
 #define SEED_OFF_POS 1
@@ -69,13 +77,22 @@ void handle_sigint(int sig) {
 
 // ADAM HYPERPARAMS
 float get_learning_rate(long step) {
-    return 0.05f;
+    if (step < 40) {
+        return 0.9f;
+    }
+    if (step < 80) {
+        return 0.7f;
+    }
+    if (step < 120) {
+        return 0.5f;
+    }
+    return 0.1f;
 }
 
 #define ADAM_BETA1 0.9f
 #define ADAM_BETA2 0.98f
 #define ADAM_EPS 1e-8f
-#define ADAM_WEIGHT_DECAY 0.001f
+#define ADAM_WEIGHT_DECAY 0.01f
 
 #define CHECK_CUDA(call) { cudaError_t err = call; if (err != cudaSuccess) { printf("CUDA Error: %s:%d\n", cudaGetErrorString(err), __LINE__); exit(1); } }
 
@@ -127,8 +144,13 @@ typedef struct {
 
 ActType *d_kv_cache = NULL;
 
+// Legacy EXP2 table (still used for some operations)
 __constant__ int32_t d_EXP2_TABLE[256];
 int32_t h_EXP2_TABLE[256];
+
+// New softmax LUT: exp(-i) * 2^20 for i in [0, 14]
+__constant__ int32_t d_EXP_LUT[SOFTMAX_LUT_SIZE];
+int32_t h_EXP_LUT[SOFTMAX_LUT_SIZE];
 __device__ int32_t d_debug_updates[2];
 __device__ unsigned long long d_total_updates;
 
@@ -138,7 +160,15 @@ double get_time_diff_ms(struct timespec start, struct timespec end) {
 }
 
 void init_tables() {
+    // Legacy base-2 table
     for(int i=0; i<256; i++) h_EXP2_TABLE[i] = (int32_t)(pow(2.0, (double)i / (1 << FIXED_POINT)) * (1 << FIXED_POINT));
+    
+    // New scaled exponential LUT: exp(-i/K) * 2^20 where K ≈ 23.08
+    // This matches legacy 2^(i/16) curve shape but with proper max-subtraction softmax
+    for(int i=0; i<SOFTMAX_LUT_SIZE; i++) {
+        double val = exp(-(double)i / SOFTMAX_EXP_SCALE) * SOFTMAX_SCALE;
+        h_EXP_LUT[i] = (val >= 1.0) ? (int32_t)round(val) : 0;
+    }
 }
 
 static inline uint32_t xorshift32_host(uint32_t *state) {
@@ -180,9 +210,18 @@ __device__ __forceinline__ uint32_t hash_rng(uint32_t s, uint32_t idx) {
     uint32_t x = s + idx * 0x9e3779b9u; x ^= x >> 16; x *= 0x85ebca6b; x ^= x >> 13; x *= 0xc2b2ae35; x ^= x >> 16; return x;
 }
 __device__ __forceinline__ int8_t noise_from_hash(uint32_t s, uint32_t idx) {
-    uint32_t r = hash_rng(s, idx); return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 15));
+    uint32_t r = hash_rng(s, idx); return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 31));
 }
 __device__ __forceinline__ int8_t clip(AccumType a) { return (a > MAX_VAL) ? MAX_VAL : ((a < MIN_VAL) ? MIN_VAL : (int8_t)a); }
+
+// Helper: Softmax exponential lookup - 256 entry version
+// Input: diff = score - max_score (should be <= 0)
+// Returns: exp(diff/K) * 2^20, clamped to [0, 255] index range
+__device__ __forceinline__ int32_t softmax_exp_lookup(int32_t diff) {
+    int index = -diff;  // diff is negative or zero, so index is positive
+    index = (index < 0) ? 0 : ((index > 255) ? 255 : index);
+    return d_EXP_LUT[index];
+}
 
 // Helper: Sum reduction + Broadcast
 __device__ __forceinline__ AccumType block_reduce_sum_broadcast(AccumType val, BlockReduce::TempStorage &storage, AccumType &shared_var) {
@@ -230,7 +269,13 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         int8_t a_tok = noise_from_hash(seed_emb, input_token);
         int8_t b_dim = noise_from_hash(seed_emb + HIDDEN_DIM, tid);
         AccumType perturb = ((AccumType)a_tok * b_dim * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-        s_x[tid] = clip((AccumType)emb + pos + perturb);
+
+        uint32_t seed_pos = (step_seed + pair_idx) + SEED_OFF_POS;
+        int8_t a_pos = noise_from_hash(seed_pos, t);
+        int8_t b_pos = noise_from_hash(seed_pos + SEQ_LEN, tid);
+        AccumType perturb_pos = ((AccumType)a_pos * b_pos * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+
+        s_x[tid] = clip((AccumType)emb + pos + perturb + perturb_pos);
         __syncthreads();
 
         // 2. Stack
@@ -276,42 +321,74 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             lkv[SEQ_LEN*HIDDEN_DIM + t*HIDDEN_DIM + tid] = vv;
             __syncthreads();
 
-            // Attention (Per Head)
+            // Attention (Per Head) - Two-Pass with atomicMax for stability
             int h = tid / HEAD_DIM;
-            int8_t *s_scores = &s_mem[2*HIDDEN_DIM]; // Accumulator
-            if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
+            int32_t *s_attn_scores = (int32_t*)&s_mem[2*HIDDEN_DIM]; // Per-head scores accumulator
+            int32_t *s_head_max = (int32_t*)&s_mem[2*HIDDEN_DIM + N_HEADS*4]; // Per-head max scores
+            
+            // Initialize per-head max to INT_MIN
+            if(tid < N_HEADS) {
+                s_attn_scores[tid] = 0;
+                s_head_max[tid] = INT_MIN;
+            }
             __syncthreads();
 
+            // PASS 1: Compute all attention scores and find max per head using atomicMax
+            for(int ctx=0; ctx <= t; ctx++) {
+                ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
+                AccumType df = (AccumType)qv * k_ctx;
+                
+                // Reduce across head (Head Size 64, Warp 32)
+                for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
+                
+                // Lane 0 of each warp has partial sum
+                if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
+                __syncthreads();
+                
+                // Update max using atomicMax (CAS-based)
+                if (tid < N_HEADS) {
+                    atomicMax(&s_head_max[tid], s_attn_scores[tid]);
+                    s_attn_scores[tid] = 0; // Reset for next context
+                }
+                __syncthreads();
+            }
+            
+            // Now s_head_max[h] contains the max score for each head
+            
+            // PASS 2: Compute exp(score - max) and weighted sum
             AttnAccumType w_v_sum = 0;
-            AttnAccumType tot_sc = 0;
+            uint64_t tot_sc = 0;
+            int32_t my_head_max = s_head_max[h];
+            
+            if(tid < N_HEADS) s_attn_scores[tid] = 0; // Reset for pass 2
+            __syncthreads();
             
             for(int ctx=0; ctx <= t; ctx++) {
-                 ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
-                 AccumType df = (AccumType)qv * k_ctx;
-                 
-                 // Reduce across head (Head Size 64, Warp 32)
-                 // Need shuffle to reduce 64 to 1.
-                 for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
-                 
-                 // Lane 0 of each warp has a partial sum for that warp's head-part.
-                 // Lane 0 (tid % 32 == 0).
-                 if ((tid % 32) == 0) atomicAdd((int32_t*)&s_scores[h*4], (int32_t)df);
-                 __syncthreads();
-                 
-                 int32_t sc = ((int32_t*)s_scores)[h*4/4]; // Head Score
-                 int idx = (sc >> 3) + 128; idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
-                 int32_t wt = d_EXP2_TABLE[idx];
-                 
-                 ActType v_ctx = lkv[SEQ_LEN*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
-                 w_v_sum += (AttnAccumType)wt * v_ctx;
-                 tot_sc += wt;
-                 
-                 __syncthreads();
-                 if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0; // Reset
-                 __syncthreads();
+                ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
+                AccumType df = (AccumType)qv * k_ctx;
+                
+                // Reduce across head
+                for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
+                
+                if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
+                __syncthreads();
+                
+                // Compute weight using new softmax LUT with max subtraction
+                int32_t sc = s_attn_scores[h];
+                int32_t shifted = (sc >> 3) - (my_head_max >> 3); // Normalize by max
+                int32_t wt = softmax_exp_lookup(shifted);
+                
+                ActType v_ctx = lkv[SEQ_LEN*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
+                w_v_sum += (AttnAccumType)wt * v_ctx;
+                tot_sc += wt;
+                
+                __syncthreads();
+                if(tid < N_HEADS) s_attn_scores[tid] = 0; // Reset
+                __syncthreads();
             }
             if(tot_sc==0) tot_sc=1;
-            ActType ao = clip(w_v_sum / tot_sc);
+            // Scale down from 2^20 precision
+            ActType ao = clip((w_v_sum / (int64_t)tot_sc));
             s_norm[tid] = ao; __syncthreads();
 
             // Output Proj
@@ -380,40 +457,61 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
         AccumType sbh = block_reduce_sum_broadcast((AccumType)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_HEAD + VOCAB_SIZE, tid), temp_storage, shared_scalar);
 
-        // Compute Logits (only first VOCAB_SIZE threads)
+        // Compute Logits with new softmax (max-subtraction for stability)
+        // Use shared memory for logits and max finding
+        int32_t *s_logits = (int32_t*)&s_mem[2*HIDDEN_DIM];
+        __shared__ int32_t s_logit_max;
+        
         if(tid < VOCAB_SIZE) {
             AccumType ah = 0;
             const WeightType *wh = &model->head[0];
             #pragma unroll 8
             for(int k=0; k<HIDDEN_DIM; k++) ah += (AccumType)s_norm[k] * wh[k*VOCAB_SIZE + tid];
             if(ns!=0) ah += ((sbh * (AccumType)noise_from_hash(step_seed + pair_idx + SEED_OFF_HEAD, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-            ActType lgt = clip(ah >> 8);
-            
-            int idx = (int32_t)lgt + 128;
-            long long ex = d_EXP2_TABLE[idx];
-             ((int32_t*)s_x)[tid] = (int32_t)ex; 
-             ((int8_t*)s_x)[HIDDEN_DIM*4 + tid] = lgt; 
+            int32_t lgt = ah >> 8;  // Keep as int32 for max comparison
+            s_logits[tid] = lgt;
+        }
+        __syncthreads();
+        
+        // Find max logit using atomicMax (thread 0 initializes, all threads update)
+        if (tid == 0) s_logit_max = INT_MIN;
+        __syncthreads();
+        if (tid < VOCAB_SIZE) atomicMax(&s_logit_max, s_logits[tid]);
+        __syncthreads();
+        
+        // Compute exp(logit - max) using new LUT
+        if(tid < VOCAB_SIZE) {
+            int32_t shifted = s_logits[tid] - s_logit_max;
+            int32_t ex = softmax_exp_lookup(shifted);
+            ((int32_t*)s_x)[tid] = ex;
+            ((int8_t*)s_x)[HIDDEN_DIM*4 + tid] = clip(s_logits[tid]); // Store clipped logit for loss
         }
         __syncthreads();
 
-        // Loss Calc (Thread 0)
+        // Loss Calc (Thread 0) - adjusted for new scale (2^20)
         if (tid == 0) {
-             uint8_t target_token = dataset[stream_pos + t + 1];
-             long long sum_ex = 0;
-             for(int i=0; i<VOCAB_SIZE; i++) sum_ex += ((int32_t*)s_x)[i];
-             
-             long long log_sum = 0;
-             if (sum_ex > 0) {
-                 long long x = sum_ex; int pos=0;
-                 while(x>=256){x>>=8; pos+=8;} if(x>=16){x>>=4; pos+=4;} if(x>=2){pos+=1;}
-                 
-                 long long rem = sum_ex - (1LL << pos);
-                 long long frac = (pos >= 4) ? (rem >> (pos - 4)) : (rem << (4 - pos));
-                 log_sum = (pos<<4) + frac - 64; 
-             }
-             int8_t tgt_lgt = ((int8_t*)s_x)[HIDDEN_DIM*4 + target_token];
-             int32_t tgt_val = (int32_t)tgt_lgt + 128;
-             my_loss += (log_sum - tgt_val);
+            uint8_t target_token = dataset[stream_pos + t + 1];
+            uint64_t sum_ex = 0;
+            for(int i=0; i<VOCAB_SIZE; i++) sum_ex += ((int32_t*)s_x)[i];
+            
+            // Cross-entropy loss: -log(p_target) = -log(exp(x_t)/sum) = log(sum) - x_t
+            // With new scale, sum is in 2^20 units
+            // log2(sum) approximation for loss computation
+            int64_t log_sum = 0;
+            if (sum_ex > 0) {
+                uint64_t x = sum_ex; int pos = 0;
+                while(x >= 256) { x >>= 8; pos += 8; }
+                if(x >= 16) { x >>= 4; pos += 4; }
+                if(x >= 4) { x >>= 2; pos += 2; }
+                if(x >= 2) { pos += 1; }
+                
+                // Scale factor: log2(2^20) = 20, so subtract 20 from pos for proper scaling
+                log_sum = (pos << 4) - (20 << 4);
+            }
+            int8_t tgt_lgt = ((int8_t*)s_x)[HIDDEN_DIM*4 + target_token];
+            int32_t tgt_val = (int32_t)tgt_lgt + 128;
+            // Restore absolute scale: add max + 128 to the relative log_sum
+            my_loss += (log_sum + s_logit_max + 128 - tgt_val);
         }
         __syncthreads(); 
     }
@@ -627,36 +725,61 @@ __global__ void generate_sequence_kernel(
             lkv[total_len*HIDDEN_DIM + t*HIDDEN_DIM + tid] = vv;
             __syncthreads();
 
-            // Attention
+            // Attention - Two-Pass with max-subtraction for stability
             int h = tid / HEAD_DIM;
-            int8_t *s_scores = &s_mem[2*HIDDEN_DIM];
-            if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
+            int32_t *s_attn_scores = (int32_t*)&s_mem[2*HIDDEN_DIM];
+            int32_t *s_head_max = (int32_t*)&s_mem[2*HIDDEN_DIM + N_HEADS*4];
+            
+            if(tid < N_HEADS) {
+                s_attn_scores[tid] = 0;
+                s_head_max[tid] = INT_MIN;
+            }
             __syncthreads();
 
+            // PASS 1: Find max score per head
+            for(int ctx=0; ctx <= t; ctx++) {
+                ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
+                AccumType df = (AccumType)qv * k_ctx;
+                for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
+                if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
+                __syncthreads();
+                
+                if (tid < N_HEADS) {
+                    atomicMax(&s_head_max[tid], s_attn_scores[tid]);
+                    s_attn_scores[tid] = 0;
+                }
+                __syncthreads();
+            }
+            
+            // PASS 2: Compute weighted sum with new softmax
             AttnAccumType w_v_sum = 0;
-            AttnAccumType tot_sc = 0;
+            uint64_t tot_sc = 0;
+            int32_t my_head_max = s_head_max[h];
+            
+            if(tid < N_HEADS) s_attn_scores[tid] = 0;
+            __syncthreads();
 
             for(int ctx=0; ctx <= t; ctx++) {
                 ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
                 AccumType df = (AccumType)qv * k_ctx;
                 for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
-                if ((tid % 32) == 0) atomicAdd((int32_t*)&s_scores[h*4], (int32_t)df);
+                if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
                 __syncthreads();
 
-                int32_t sc = ((int32_t*)s_scores)[h*4/4];
-                int idx = (sc >> 3) + 128; idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
-                int32_t wt = d_EXP2_TABLE[idx];
+                int32_t sc = s_attn_scores[h];
+                int32_t shifted = (sc >> 3) - (my_head_max >> 3);
+                int32_t wt = softmax_exp_lookup(shifted);
 
                 ActType v_ctx = lkv[total_len*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
                 w_v_sum += (AttnAccumType)wt * v_ctx;
                 tot_sc += wt;
                 
                 __syncthreads();
-                if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
+                if(tid < N_HEADS) s_attn_scores[tid] = 0;
                 __syncthreads();
             }
             if(tot_sc==0) tot_sc=1;
-            ActType ao = clip(w_v_sum / tot_sc);
+            ActType ao = clip(w_v_sum / (int64_t)tot_sc);
             s_norm[tid] = ao; __syncthreads();
 
             // Output
@@ -738,27 +861,64 @@ void ensure_models_dir() {
     }
 }
 
-void update_last_link(const char *target_filename) {
-    const char *link_path = "models/egg_transformer_last.bin";
+void update_last_link(const char *target_filename, const char *link_name) {
+    char link_path[256];
+    sprintf(link_path, "models/%s", link_name);
     unlink(link_path);
     symlink(target_filename, link_path);
 }
 
-void save_checkpoint(TransformerModel *model, long step) {
-    char filename_only[128];
-    sprintf(filename_only, "egg_step-%08ld.bin", step);
-    char full_path[256];
-    sprintf(full_path, "models/%s", filename_only);
+void save_model_info() {
+    FILE *f = fopen("models/model.info", "w");
+    if(!f) return;
     
-    FILE *f = fopen(full_path, "wb");
-    if (!f) { printf("Error opening %s for writing\n", full_path); return; }
-    if (fwrite(model, sizeof(TransformerModel), 1, f) != 1) {
-        printf("Error writing model to %s\n", full_path);
-    } else {
-       // printf("Model saved to %s\n", full_path);
-        update_last_link(filename_only);
-    }
+    long params = sizeof(TransformerModel);
+    long adam_size = sizeof(AdamModel);
+    
+    fprintf(f, "Model Configuration:\n");
+    fprintf(f, "HIDDEN_DIM: %d\n", HIDDEN_DIM);
+    fprintf(f, "HEAD_DIM: %d\n", HEAD_DIM);
+    fprintf(f, "N_LAYERS: %d\n", N_LAYERS);
+    fprintf(f, "SEQ_LEN: %d\n", SEQ_LEN);
+    fprintf(f, "VOCAB_SIZE: %d\n", VOCAB_SIZE);
+    fprintf(f, "N_HEADS: %d\n", N_HEADS);
+    fprintf(f, "Model Parameters: %ld (%.2f MB)\n", params, params/(1024.0*1024.0));
+    fprintf(f, "Adam State Size: %ld (%.2f MB)\n", adam_size, adam_size/(1024.0*1024.0));
+    fprintf(f, "Population: %d\n", POPULATION_SIZE);
+    fprintf(f, "Softmax Scale: 2^%d\n", SOFTMAX_SCALE_BIT);
+    
+    printf("\n--- Model Architecture ---\n");
+    printf("Parameters: %ld (%.2f MB)\n", params, params/(1024.0*1024.0));
+    printf("Optimizer State: %.2f MB\n", adam_size/(1024.0*1024.0));
+    printf("Layers: %d, Hidden: %d, Heads: %d\n", N_LAYERS, HIDDEN_DIM, N_HEADS);
+    printf("Sequence Length: %d, Vocab: %d\n", SEQ_LEN, VOCAB_SIZE);
+    printf("--------------------------\n");
+    
     fclose(f);
+}
+
+void save_checkpoint(TransformerModel *model, AdamModel *adam, long step) {
+    char name_model[128], name_adam[128];
+    sprintf(name_model, "egg_step-%08ld.model.bin", step);
+    sprintf(name_adam, "egg_step-%08ld.adam.bin", step);
+    
+    char path_model[256], path_adam[256];
+    sprintf(path_model, "models/%s", name_model);
+    sprintf(path_adam, "models/%s", name_adam);
+    
+    FILE *f = fopen(path_model, "wb");
+    if (f) {
+        fwrite(model, sizeof(TransformerModel), 1, f);
+        fclose(f);
+        update_last_link(name_model, "egg_transformer_last.model.bin");
+    }
+    
+    f = fopen(path_adam, "wb");
+    if (f) {
+        fwrite(adam, sizeof(AdamModel), 1, f);
+        fclose(f);
+        update_last_link(name_adam, "egg_transformer_last.adam.bin");
+    }
 }
 
 int load_model(const char *filename, TransformerModel *model) {
@@ -779,6 +939,7 @@ int main() {
     signal(SIGINT, handle_sigint);
     init_tables();
     cudaMemcpyToSymbol(d_EXP2_TABLE, h_EXP2_TABLE, 256*sizeof(int32_t));
+    cudaMemcpyToSymbol(d_EXP_LUT, h_EXP_LUT, SOFTMAX_LUT_SIZE*sizeof(int32_t));
 
     printf("\n=== EGG TRANSFORMER ADAM ===\n");
     printf("AdamW Config: B1=%.3f B2=%.3f EPS=%.1e WD=%.4f (Dynamic LR)\n", 
@@ -791,19 +952,35 @@ int main() {
     ds.data=(uint8_t*)malloc(ds.length); fread(ds.data,1,ds.length,f); fclose(f);
 
     TransformerModel *h_model = (TransformerModel*)calloc(1, sizeof(TransformerModel));
+    AdamModel *h_adam_state = (AdamModel*)calloc(1, sizeof(AdamModel));
+    
     ensure_models_dir();
-    if (load_model("models/egg_transformer_last.bin", h_model)) {
-        printf("Resumed from models/egg_transformer_last.bin\n");
+    save_model_info();
+    
+    if (load_model("models/egg_transformer_last.model.bin", h_model)) {
+        printf("Resumed from models/egg_transformer_last.model.bin\n");
+        // Try load adam
+        FILE *fa = fopen("models/egg_transformer_last.adam.bin", "rb");
+        if(fa) {
+            fread(h_adam_state, sizeof(AdamModel), 1, fa);
+            fclose(fa);
+            printf("Resumed Adam state.\n");
+        }
+    } else if (load_model("models/egg_transformer_last.bin", h_model)) {
+        // Fallback for legacy file
+        printf("Resumed from legacy models/egg_transformer_last.bin\n");
     } else {
         init_model(h_model);
     }
+    
     TransformerModel *d_model; CHECK_CUDA(cudaMalloc(&d_model, sizeof(TransformerModel)));
     CHECK_CUDA(cudaMemcpy(d_model, h_model, sizeof(TransformerModel), cudaMemcpyHostToDevice));
 
-    // Allocate Adam State (Zero intiialized)
+    // Allocate Adam State
     AdamModel *d_adam_state; 
     CHECK_CUDA(cudaMalloc(&d_adam_state, sizeof(AdamModel)));
-    CHECK_CUDA(cudaMemset(d_adam_state, 0, sizeof(AdamModel)));
+    CHECK_CUDA(cudaMemcpy(d_adam_state, h_adam_state, sizeof(AdamModel), cudaMemcpyHostToDevice));
+    // Note: if fresh start, h_adam_state is 0-calloc'd, so this is equiv to Memset 0
 
     uint8_t *d_dataset; CHECK_CUDA(cudaMalloc(&d_dataset, ds.length));
     CHECK_CUDA(cudaMemcpy(d_dataset, ds.data, ds.length, cudaMemcpyHostToDevice));
@@ -867,7 +1044,8 @@ int main() {
         update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_f, (AdamParam*)d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, d_fit, seed, current_lr);
         update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512 >>>((WeightType*)d_model->head, (AdamParam*)d_adam_state->head, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_HEAD, SEED_OFF_HEAD+VOCAB_SIZE, 0, d_fit, seed, current_lr);
         update_matrix_adam_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((WeightType*)d_model->embedding, (AdamParam*)d_adam_state->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, current_lr);
-        
+        update_matrix_adam_kernel<<< (SEQ_LEN*HIDDEN_DIM+511)/512, 512 >>>((WeightType*)d_model->pos_emb, (AdamParam*)d_adam_state->pos_emb, SEQ_LEN, HIDDEN_DIM, SEED_OFF_POS+SEQ_LEN, SEED_OFF_POS, 0, d_fit, seed, current_lr);
+
         CHECK_CUDA(cudaDeviceSynchronize());
         clock_gettime(CLOCK_MONOTONIC, &t1);
         
@@ -905,12 +1083,13 @@ int main() {
             printf("\033[0m\n\n");
 
             CHECK_CUDA(cudaMemcpy(h_model, d_model, sizeof(TransformerModel), cudaMemcpyDeviceToHost));
-            save_checkpoint(h_model, step);
+            CHECK_CUDA(cudaMemcpy(h_adam_state, d_adam_state, sizeof(AdamModel), cudaMemcpyDeviceToHost));
+            save_checkpoint(h_model, h_adam_state, step);
         }
     }
     cudaFree(d_gen_buf); cudaFree(d_gen_kv);
 
-    free(h_model); free(ds.data);
+    free(h_model); free(h_adam_state); free(ds.data);
     cudaFree(d_model); cudaFree(d_dataset); cudaFree(d_loss); cudaFree(d_fit); cudaFree(d_kv_cache);
     cudaFree(d_adam_state);
     return 0;
