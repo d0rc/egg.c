@@ -18,6 +18,8 @@
 #include <thrust/functional.h>
 #include <cub/cub.cuh>
 
+#include "egg_debug_printer.h"
+
 volatile sig_atomic_t keep_running = 1;
 
 void handle_sigint(int sig) {
@@ -27,9 +29,9 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 512
+#define HIDDEN_DIM 256
 #define HEAD_DIM 64
-#define N_LAYERS 12
+#define N_LAYERS 8
 #define SEQ_LEN 128     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
@@ -38,16 +40,16 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 2)
+#define POPULATION_BATCH_SIZE (8192 * 5)
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 1)
 
 #define FIXED_POINT 4
-#define SIGMA_SHIFT 0
+#define SIGMA_SHIFT 3
 #define SIGMA_SHIFT_VECTOR 2
 #define MAX_VAL 127
 #define MIN_VAL -127
 
-#define SOFTMAX_SCALE_BIT 20
+#define SOFTMAX_SCALE_BIT 18
 #define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)  
 #define SOFTMAX_LUT_SIZE 256
 #define SOFTMAX_EXP_SCALE 23.08
@@ -83,10 +85,10 @@ void handle_sigint(int sig) {
 #define SEED_OFF_LN_F_BIAS 910
 #define SEED_OFF_HEAD 999
 
-#define SHIFT_ATTN 3
+#define SHIFT_ATTN 4
 #define SHIFT_PROJ 8
-#define SHIFT_MLP_UP 4
-#define SHIFT_MLP_DOWN 9
+#define SHIFT_MLP_UP 8
+#define SHIFT_MLP_DOWN 10
 
 // ADAM HYPERPARAMS
 float get_learning_rate(long step) {
@@ -304,6 +306,17 @@ __device__ __forceinline__ int simd_dp4a(int a, int b, int c) {
     return __dp4a(a, b, c);
 }
 
+__device__ __forceinline__ WeightType get_embedding_byte(const WeightType *packed_embedding, int hidden_idx, int token_idx) {
+    // Packed layout: [HIDDEN_DIM/4, VOCAB_SIZE] of int32 (4 bytes)
+    // Map (hidden_idx, token_idx) to packed layout
+    int chunk_idx = hidden_idx >> 2; 
+    int byte_off = hidden_idx & 3;
+    // Calculate linear byte index: (chunk * VOCAB + token) * 4 + offset
+    // The packed_embedding pointer is technically WeightType* (int8_t*), so we treat it as byte array.
+    long idx = ((long)chunk_idx * VOCAB_SIZE + token_idx) * 4 + byte_off;
+    return packed_embedding[idx];
+}
+
 // Helper: Sum reduction + Broadcast
 __device__ __forceinline__ AccumType block_reduce_sum_broadcast(AccumType val, BlockReduce::TempStorage &storage, AccumType &shared_var) {
     AccumType total = BlockReduce(storage).Sum(val);
@@ -314,6 +327,8 @@ __device__ __forceinline__ AccumType block_reduce_sum_broadcast(AccumType val, B
     return ret;
 }
 
+
+// debug_stat moved to egg_debug_printer.h
 
 __device__ __forceinline__ AccumType apply_rope_integer(AccumType val, int t, int tid) {
 
@@ -342,7 +357,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     const TransformerModel * __restrict__ model,
     ActType * __restrict__ global_kv_cache,
     int32_t *accum_loss, uint32_t step_seed,
-    int global_pop_offset
+    int global_pop_offset, long step
 ) {
     int p_idx = global_pop_offset + blockIdx.x; 
     if (p_idx >= POPULATION_SIZE) return;
@@ -365,10 +380,16 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
     for (int t = 0; t < SEQ_LEN; t++) {
         
+        if (step%5 == 0 && blockIdx.x == 0 && tid == 0 && t == 0) {
+             printf("DEBUG: Dataset[0..10] at stream_pos=%ld: ", stream_pos);
+             for(int i=0; i<10 && stream_pos+i < data_len; i++) printf("%d(%c) ", dataset[stream_pos+i], (dataset[stream_pos+i]>=32 && dataset[stream_pos+i]<=126) ? dataset[stream_pos+i] : '.');
+             printf("\n");
+        }
+
         // 1. Embedding
         uint8_t input_token = dataset[stream_pos + t];
         uint32_t seed_emb = (step_seed + pair_idx) + SEED_OFF_EMB;
-        WeightType emb = model->embedding[tid * VOCAB_SIZE + input_token];
+        WeightType emb = get_embedding_byte(model->embedding, tid, input_token);
         WeightType ebias = model->emb_bias[tid];
         int8_t emb_bias_n = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_BIAS, tid);
         
@@ -379,6 +400,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
         s_x[tid] = clip((AccumType)emb + ebias + (((AccumType)emb_bias_n * ns) >> SIGMA_SHIFT_VECTOR) + perturb);
         __syncthreads();
+        EGG_TRACE_STAT(step, t, -1, "Emb", s_x, HIDDEN_DIM);
 
         // 2. Stack
         for (int l = 0; l < N_LAYERS; l++) {
@@ -395,6 +417,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             ActType r_in = clip(((AccumType)s_x[tid] * (ln_w + (((AccumType)ln_n * ns) >> SIGMA_SHIFT_VECTOR))) / mean 
                               + ln_b + (((AccumType)ln_bn * ns) >> SIGMA_SHIFT_VECTOR)); // Add bias
             s_norm[tid] = r_in; __syncthreads();
+            EGG_TRACE_STAT(step, t, l, "LN1", s_norm, HIDDEN_DIM);
 
             // QKV Projection (Rank-1 Fast)
             AccumType sbq = block_reduce_sum_broadcast((AccumType)r_in * noise_from_hash(seed_base + SEED_OFF_Q_B, tid), temp_storage, shared_scalar);
@@ -480,6 +503,9 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             
             if(tid < N_HEADS) s_attn_scores[tid] = 0; // Reset for pass 2
             __syncthreads();
+
+            EGG_TRACE_ATTN_DECL(attn_dbg);
+            EGG_TRACE_ATTN_INIT(attn_dbg);
             
             for(int ctx=0; ctx <= t; ctx++) {
                 ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
@@ -496,6 +522,9 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 int32_t shifted = (sc >> SHIFT_ATTN) - (my_head_max >> SHIFT_ATTN); // Normalize by max. Scaled down.
                 int32_t wt = softmax_exp_lookup(shifted);
                 
+                EGG_TRACE_ATTN_PROBE(step, l, h, t, ctx, sc, my_head_max, shifted, wt);
+                EGG_TRACE_ATTN_ACCUM(attn_dbg, wt);
+
                 ActType v_ctx = lkv[SEQ_LEN*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
                 w_v_sum += (AttnAccumType)wt * v_ctx;
                 tot_sc += wt;
@@ -504,6 +533,8 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 if(tid < N_HEADS) s_attn_scores[tid] = 0; // Reset
                 __syncthreads();
             }
+            EGG_TRACE_ATTN_FINISH(attn_dbg, step, l, h, t);
+
             if(tot_sc==0) tot_sc=1;
             // Scale down from 2^20 precision
             ActType ao = clip((w_v_sum / (int64_t)tot_sc));
@@ -520,6 +551,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             }
             if(ns!=0) aco += ((sbo * (AccumType)noise_from_hash(seed_base + SEED_OFF_O_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
             s_x[tid] = clip((AccumType)s_x[tid] + (aco >> SHIFT_PROJ)); __syncthreads();
+            EGG_TRACE_STAT(step, t, l, "Attn", s_x, HIDDEN_DIM);
 
             // MLP Block
             // Norm 2 (With Bias)
@@ -532,6 +564,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             ActType n2x = clip(((AccumType)s_x[tid] * (l2w + (((AccumType)l2n*ns)>>SIGMA_SHIFT_VECTOR))) / mmn
                              + l2b + (((AccumType)l2bn * ns) >> SIGMA_SHIFT_VECTOR)); // Add bias
             s_norm[tid] = n2x; __syncthreads();
+            EGG_TRACE_STAT(step, t, l, "LN2", s_norm, HIDDEN_DIM);
 
             // Expand
             AccumType sbup = block_reduce_sum_broadcast((AccumType)n2x * noise_from_hash(seed_base + SEED_OFF_MLP_UP_B, tid), temp_storage, shared_scalar);
@@ -575,6 +608,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             int8_t n_b_dn = noise_from_hash(seed_base + SEED_OFF_MLP_BIAS_DOWN, tid);
             
             s_x[tid] = clip((AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + b_dn + (((AccumType)n_b_dn * ns) >> SIGMA_SHIFT_VECTOR)); __syncthreads();
+            EGG_TRACE_STAT(step, t, l, "MLP", s_x, HIDDEN_DIM);
         }
 
         // 3. Final Head
@@ -815,7 +849,7 @@ __global__ void generate_sequence_kernel(
         uint8_t input_token = buffer[t];
         
         // 1. Embedding
-        WeightType emb = model->embedding[tid * VOCAB_SIZE + input_token];
+        WeightType emb = get_embedding_byte(model->embedding, tid, input_token);
         WeightType ebias = model->emb_bias[tid];
         
         s_x[tid] = clip((AccumType)emb + ebias);
@@ -972,6 +1006,8 @@ __global__ void generate_sequence_kernel(
         ActType *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
 
+        __shared__ int32_t s_gen_max;
+
         if(tid < VOCAB_SIZE) {
             AccumType ah = 0;
             const int32_t *wh_p = (const int32_t*)model->embedding;
@@ -979,7 +1015,18 @@ __global__ void generate_sequence_kernel(
             for(int k=0; k<HIDDEN_DIM/4; k++) {
                 ah = simd_dp4a(v_ptr_h[k], wh_p[k * VOCAB_SIZE + tid], ah);
             }
-            shared_logits[tid] = (int32_t)d_EXP2_TABLE[(int32_t)clip(ah>>8) + 128];
+            shared_logits[tid] = ah >> 8;
+        }
+        __syncthreads();
+
+        if (tid == 0) s_gen_max = INT_MIN;
+        __syncthreads();
+        if (tid < VOCAB_SIZE) atomicMax(&s_gen_max, shared_logits[tid]);
+        __syncthreads();
+
+        if(tid < VOCAB_SIZE) {
+            int32_t shifted = shared_logits[tid] - s_gen_max;
+            shared_logits[tid] = softmax_exp_lookup(shifted);
         }
         __syncthreads();
 
@@ -1171,7 +1218,7 @@ int main() {
         size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM); 
         for (int offset = 0; offset < POPULATION_SIZE; offset += POPULATION_BATCH_SIZE) {
             train_sequence_kernel<<<POPULATION_BATCH_SIZE, BLOCK_THREADS, sm_size>>>(
-                d_dataset, ds.length, step*SEQ_LEN, d_model, d_kv_cache, d_loss, seed, offset
+                d_dataset, ds.length, step*SEQ_LEN, d_model, d_kv_cache, d_loss, seed, offset, step
             );
         }
         CHECK_CUDA(cudaDeviceSynchronize());
