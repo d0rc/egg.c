@@ -30,7 +30,7 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 256
+#define HIDDEN_DIM 512
 #define HEAD_DIM 64
 #define N_LAYERS 12
 #define SEQ_LEN 128     
@@ -41,7 +41,7 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 3)
+#define POPULATION_BATCH_SIZE (8192 + 4096)
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
 
 #define FIXED_POINT 4
@@ -535,7 +535,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         // Reuse scratch/warp maxs buffer which is free here
         int32_t *warp_maxs_scratch_init = (int32_t*)&s_mem[2*HIDDEN_DIM];
         AccumType imlp_res = (AccumType)s_x[tid] + (aidn >> SHIFT_MLP_DOWN) + b_idn + (((AccumType)n_b_idn * ns) >> SIGMA_SHIFT_VECTOR);
-        s_x[tid] = adaptive_layer_normalize(imlp_res, tid, warp_maxs_scratch_init); __syncthreads();
+        s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(imlp_res, tid, warp_maxs_scratch_init); __syncthreads();
         
         EGG_TRACE_STAT(step, t, -1, "InitMLP", s_x, HIDDEN_DIM);
         // ---------------------
@@ -578,9 +578,9 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             // Adaptive QKV Normalization
             // Reuse shared memory scratchpad at offset 2*HIDDEN_DIM (free at this point)
             int32_t *warp_maxs_scratch = (int32_t*)&s_mem[2*HIDDEN_DIM];
-            ActType qv = adaptive_qkv_normalize(aq, tid, warp_maxs_scratch);
-            ActType kv = adaptive_qkv_normalize(ak, tid, warp_maxs_scratch);
-            ActType vv = adaptive_qkv_normalize(av, tid, warp_maxs_scratch);
+            ActType qv = adaptive_qkv_normalize<BLOCK_THREADS/32>(aq, tid, warp_maxs_scratch);
+            ActType kv = adaptive_qkv_normalize<BLOCK_THREADS/32>(ak, tid, warp_maxs_scratch);
+            ActType vv = adaptive_qkv_normalize<BLOCK_THREADS/32>(av, tid, warp_maxs_scratch);
             
             // Store KV
             ActType *lkv = global_kv_cache + kv_ind_offset + (l * kv_layer_stride);
@@ -671,7 +671,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             AccumType aco = compute_linear_projection(v_ptr_o, wo_p, HIDDEN_DIM/4, HIDDEN_DIM, tid, sbo, seed_base + SEED_OFF_O_A, ns);
             // UPDATE: Adaptive Layer Norm for Attention Residual
             AccumType attn_res = (AccumType)s_x[tid] + (aco >> SHIFT_OUT);
-            s_x[tid] = adaptive_layer_normalize(attn_res, tid, warp_maxs_scratch); __syncthreads();
+            s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(attn_res, tid, warp_maxs_scratch); __syncthreads();
             
             EGG_TRACE_STAT(step, t, l, "Attn", s_x, HIDDEN_DIM);
 
@@ -723,7 +723,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             
             // UPDATE: Adaptive Layer Norm for MLP Residual
             AccumType mlp_res = (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + b_dn + (((AccumType)n_b_dn * ns) >> SIGMA_SHIFT_VECTOR);
-            s_x[tid] = adaptive_layer_normalize(mlp_res, tid, warp_maxs_scratch); __syncthreads();
+            s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(mlp_res, tid, warp_maxs_scratch); __syncthreads();
             
             EGG_TRACE_STAT(step, t, l, "MLP", s_x, HIDDEN_DIM);
         }
@@ -1001,7 +1001,7 @@ __global__ void generate_sequence_kernel(
         
         int32_t *warp_maxs_scratch_init = (int32_t*)&s_mem[2*HIDDEN_DIM];
         AccumType imlp_res = (AccumType)s_x[tid] + (aidn >> SHIFT_MLP_DOWN) + b_idn;
-        s_x[tid] = adaptive_layer_normalize(imlp_res, tid, warp_maxs_scratch_init); __syncthreads();
+        s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(imlp_res, tid, warp_maxs_scratch_init); __syncthreads();
         // ------------------------------
 
         // 2. Layers
@@ -1032,9 +1032,9 @@ __global__ void generate_sequence_kernel(
             // Adaptive QKV Normalization
             // Reuse shared memory scratchpad 
             int32_t *warp_maxs_scratch = (int32_t*)&s_mem[2*HIDDEN_DIM];
-            ActType qv = adaptive_qkv_normalize(aq, tid, warp_maxs_scratch);
-            ActType kv = adaptive_qkv_normalize(ak, tid, warp_maxs_scratch);
-            ActType vv = adaptive_qkv_normalize(av, tid, warp_maxs_scratch);
+            ActType qv = adaptive_qkv_normalize<BLOCK_THREADS/32>(aq, tid, warp_maxs_scratch);
+            ActType kv = adaptive_qkv_normalize<BLOCK_THREADS/32>(ak, tid, warp_maxs_scratch);
+            ActType vv = adaptive_qkv_normalize<BLOCK_THREADS/32>(av, tid, warp_maxs_scratch);
 
             // Store KV
             ActType *lkv = kv_cache + (l * kv_layer_stride);
@@ -1105,7 +1105,7 @@ __global__ void generate_sequence_kernel(
             AccumType aco = compute_linear_projection(v_ptr_o, wo_p, HIDDEN_DIM/4, HIDDEN_DIM, tid, 0, 0, 0);
             // UPDATE: Adaptive Layer Norm for Attn Residual (Gen)
             AccumType attn_res = (AccumType)s_x[tid] + (aco >> SHIFT_OUT);
-            s_x[tid] = adaptive_layer_normalize(attn_res, tid, warp_maxs_scratch); __syncthreads();
+            s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(attn_res, tid, warp_maxs_scratch); __syncthreads();
 
             // MLP
             AccumType mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
@@ -1133,7 +1133,7 @@ __global__ void generate_sequence_kernel(
             WeightType b_dn = model->mlp_bias_down[l][tid];
             // UPDATE: Adaptive Layer Norm for MLP Residual (Gen)
             AccumType mlp_res = (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + b_dn;
-            s_x[tid] = adaptive_layer_normalize(mlp_res, tid, warp_maxs_scratch); __syncthreads();
+            s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(mlp_res, tid, warp_maxs_scratch); __syncthreads();
         }
 
         // Final Head
