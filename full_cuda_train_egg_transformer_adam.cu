@@ -463,158 +463,152 @@ __device__ __forceinline__ ActType apply_standard_norm(
     return clip( (x * w_mod) / mn + b_mod );
 }
 
-__device__ void compute_transformer_layer(
+struct MlpConfig {
+    int off_ln, off_ln_b;
+    int off_up_a, off_up_b, off_bias_up;
+    int off_dn_a, off_dn_b, off_bias_dn;
+    const char *n1, *n2, *n3;
+};
+__device__ const MlpConfig CFG_MLP_INIT = {
+    SEED_OFF_LN_INIT, SEED_OFF_LN_INIT_BIAS,
+    SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, SEED_OFF_EMB_MLP_BIAS_UP,
+    SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, SEED_OFF_EMB_MLP_BIAS_DOWN,
+    "LN_Init", "InitMLP_Exp", "InitMLP"
+};
+__device__ const MlpConfig CFG_MLP_LAYER = {
+    SEED_OFF_LN_2, SEED_OFF_LN_2_BIAS,
+    SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, SEED_OFF_MLP_BIAS_UP,
+    SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, SEED_OFF_MLP_BIAS_DOWN,
+    "LN2", "MLP_Exp", "MLP"
+};
+
+__device__ void compute_mlp(
     int l, int t, int tid,
-    const TransformerModel * __restrict__ model,
-    ActType * __restrict__ lkv_k, 
-    ActType * __restrict__ lkv_v,
-    ActType *s_x,
-    ActType *s_mem,
-    BlockReduce::TempStorage &temp_storage,
-    AccumType &shared_scalar,
-    uint32_t seed_base,
-    int ns,
-    long step, // For tracing (-1 if generation)
-    int global_pop_offset
+    ActType *s_x, ActType *s_mem,
+    BlockReduce::TempStorage &temp_storage, AccumType &shared_scalar,
+    // Weights
+    const WeightType *ln_w, const WeightType *ln_b,
+    const WeightType *up_w, const WeightType *up_b,
+    const WeightType *dn_w, const WeightType *dn_b,
+    // Config
+    uint32_t seed_base, int ns, long step, int global_pop_offset,
+    const MlpConfig &cfg
 ) {
     ActType *s_norm = &s_mem[HIDDEN_DIM];
-    
-    // 1. LN 1
-    s_norm[tid] = apply_standard_norm(
-        s_x[tid], tid, temp_storage, shared_scalar,
-        model->ln_1[l][tid], model->ln_1_bias[l][tid],
-        seed_base, SEED_OFF_LN_1, SEED_OFF_LN_1_BIAS, ns
-    );
+    s_norm[tid] = apply_standard_norm(s_x[tid], tid, temp_storage, shared_scalar, ln_w[tid], ln_b[tid], seed_base, cfg.off_ln, cfg.off_ln_b, ns);
     __syncthreads();
+    if(step != -1) EGG_TRACE_STAT(step, t, l, cfg.n1, s_norm, HIDDEN_DIM);
+
+    AccumType sb = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + cfg.off_up_b, tid), temp_storage, shared_scalar);
+    ActType *s_mlp = &s_mem[2*HIDDEN_DIM + 256];
+    for(int sub=0; sub<4; sub++) {
+        int oidx = tid + sub*HIDDEN_DIM;
+        AccumType a = compute_linear_projection((int32_t*)s_norm, (const int32_t*)up_w, HIDDEN_DIM/4, 4*HIDDEN_DIM, oidx, sb, seed_base + cfg.off_up_a, ns);
+        WeightType b = up_b[oidx];
+        int8_t nb = noise_from_hash(seed_base + cfg.off_bias_up, oidx);
+        s_mlp[oidx] = d_ACT_LUT[(uint8_t)clip((a>>SHIFT_MLP_UP) + b + (((AccumType)nb * ns) >> SIGMA_SHIFT_VECTOR))];
+    }
+    __syncthreads();
+    if(step != -1) EGG_TRACE_STAT(step, t, l, cfg.n2, s_mlp, 4*HIDDEN_DIM);
+
+    AccumType pb = 0;
+    for(int sub=0; sub<4; sub++) pb += (AccumType)s_mlp[tid + sub*HIDDEN_DIM] * noise_from_hash(seed_base + cfg.off_dn_b, tid + sub*HIDDEN_DIM);
+    sb = block_reduce_sum_broadcast(pb, temp_storage, shared_scalar);
+
+    AccumType adn = compute_linear_projection((int32_t*)s_mlp, (const int32_t*)dn_w, HIDDEN_DIM, HIDDEN_DIM, tid, sb, seed_base + cfg.off_dn_a, ns);
+    WeightType bdn = dn_b[tid];
+    int8_t nbdn = noise_from_hash(seed_base + cfg.off_bias_dn, tid);
+    int32_t *w_max = (int32_t*)&s_mem[2*HIDDEN_DIM];
     
+    s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>( (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + bdn + (((AccumType)nbdn * ns) >> SIGMA_SHIFT_VECTOR), tid, w_max); 
+    __syncthreads();
+    if(step != -1) EGG_TRACE_STAT(step, t, l, cfg.n3, s_x, HIDDEN_DIM);
+}
+
+__device__ void compute_attention(
+    int l, int t, int tid,
+    const TransformerModel * __restrict__ model,
+    ActType *lkv_k, ActType *lkv_v,
+    ActType *s_x, ActType *s_mem,
+    BlockReduce::TempStorage &temp_storage, AccumType &shared_scalar,
+    uint32_t seed_base, int ns, long step, int global_pop_offset
+) {
+    ActType *s_norm = &s_mem[HIDDEN_DIM];
+    s_norm[tid] = apply_standard_norm(s_x[tid], tid, temp_storage, shared_scalar, model->ln_1[l][tid], model->ln_1_bias[l][tid], seed_base, SEED_OFF_LN_1, SEED_OFF_LN_1_BIAS, ns);
+    __syncthreads();
     if(step != -1) EGG_TRACE_STAT(step, t, l, "LN1", s_norm, HIDDEN_DIM);
 
-    // 2. QKV
     AccumType sbq = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + SEED_OFF_Q_B, tid), temp_storage, shared_scalar);
     AccumType sbk = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + SEED_OFF_K_B, tid), temp_storage, shared_scalar);
     AccumType sbv = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + SEED_OFF_V_B, tid), temp_storage, shared_scalar);
 
-    int32_t *v_ptr = (int32_t*)s_norm;
     AccumType aq, ak, av;
-    compute_qkv_projection(v_ptr, (const int32_t*)model->w_q[l], (const int32_t*)model->w_k[l], (const int32_t*)model->w_v[l],
-                           HIDDEN_DIM/4, HIDDEN_DIM, tid, aq, ak, av, sbq, sbk, sbv, seed_base, ns);
+    compute_qkv_projection((int32_t*)s_norm, (const int32_t*)model->w_q[l], (const int32_t*)model->w_k[l], (const int32_t*)model->w_v[l], HIDDEN_DIM/4, HIDDEN_DIM, tid, aq, ak, av, sbq, sbk, sbv, seed_base, ns);
 
-    aq = apply_rope_integer(aq, t, tid);
-    ak = apply_rope_integer(ak, t, tid);
-
-    int32_t *warp_maxs_scratch = (int32_t*)&s_mem[2*HIDDEN_DIM];
-    ActType qv = adaptive_qkv_normalize<BLOCK_THREADS/32>(aq, tid, warp_maxs_scratch);
-    ActType kv = adaptive_qkv_normalize<BLOCK_THREADS/32>(ak, tid, warp_maxs_scratch);
-    ActType vv = adaptive_qkv_normalize<BLOCK_THREADS/32>(av, tid, warp_maxs_scratch);
-
-    lkv_k[t*HIDDEN_DIM + tid] = kv;
-    lkv_v[t*HIDDEN_DIM + tid] = vv;
+    int32_t *w_max = (int32_t*)&s_mem[2*HIDDEN_DIM];
+    ActType qv = adaptive_qkv_normalize<BLOCK_THREADS/32>(apply_rope_integer(aq, t, tid), tid, w_max);
+    lkv_k[t*HIDDEN_DIM + tid] = adaptive_qkv_normalize<BLOCK_THREADS/32>(apply_rope_integer(ak, t, tid), tid, w_max);
+    lkv_v[t*HIDDEN_DIM + tid] = adaptive_qkv_normalize<BLOCK_THREADS/32>(av, tid, w_max);
     __syncthreads();
 
-    // 3. Attention
+    // Attention
+    int32_t *s_attn = (int32_t*)&s_mem[2*HIDDEN_DIM];
+    int32_t *s_h_max = (int32_t*)&s_mem[2*HIDDEN_DIM + N_HEADS*4];
     int h = tid / HEAD_DIM;
-    int32_t *s_attn_scores = (int32_t*)&s_mem[2*HIDDEN_DIM];
-    int32_t *s_head_max = (int32_t*)&s_mem[2*HIDDEN_DIM + N_HEADS*4];
-    
-    if(tid < N_HEADS) { s_attn_scores[tid] = 0; s_head_max[tid] = INT_MIN; }
+    if(tid < N_HEADS) { s_attn[tid] = 0; s_h_max[tid] = INT_MIN; }
     __syncthreads();
 
-    // Pass 1: Max
+    // Pass 1
     for(int ctx=0; ctx <= t; ctx++) {
-        ActType k_ctx = lkv_k[ctx*HIDDEN_DIM + tid];
-        AccumType df = (AccumType)qv * k_ctx;
+        AccumType df = (AccumType)qv * lkv_k[ctx*HIDDEN_DIM + tid];
         for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
-        if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
+        if ((tid % 32) == 0) atomicAdd(&s_attn[h], (int32_t)df);
         __syncthreads();
-        if (tid < N_HEADS) { atomicMax(&s_head_max[tid], s_attn_scores[tid]); s_attn_scores[tid] = 0; }
+        if (tid < N_HEADS) { atomicMax(&s_h_max[tid], s_attn[tid]); s_attn[tid] = 0; }
         __syncthreads();
     }
-
-    // Pass 2: Sum
-    AttnAccumType w_v_sum = 0;
-    uint64_t tot_sc = 0;
-    int32_t my_head_max = s_head_max[h];
-    if(tid < N_HEADS) s_attn_scores[tid] = 0;
+    // Pass 2
+    AttnAccumType w_v_sum = 0; uint64_t tot_sc = 0; int32_t my_h_max = s_h_max[h];
+    if(tid < N_HEADS) s_attn[tid] = 0;
     __syncthreads();
     
-    EGG_TRACE_ATTN_DECL(attn_dbg);
-    EGG_TRACE_ATTN_INIT(attn_dbg);
+    EGG_TRACE_ATTN_DECL(attn_dbg); EGG_TRACE_ATTN_INIT(attn_dbg);
 
     for(int ctx=0; ctx <= t; ctx++) {
-        ActType k_ctx = lkv_k[ctx*HIDDEN_DIM + tid];
-        AccumType df = (AccumType)qv * k_ctx;
+        AccumType df = (AccumType)qv * lkv_k[ctx*HIDDEN_DIM + tid];
         for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
-        if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
+        if ((tid % 32) == 0) atomicAdd(&s_attn[h], (int32_t)df);
         __syncthreads();
-
-        int32_t sc = s_attn_scores[h];
-        int32_t shifted = (sc >> SHIFT_ATTN) - (my_head_max >> SHIFT_ATTN);
-        int32_t wt = softmax_exp_lookup(shifted);
-        
-        EGG_TRACE_ATTN_PROBE(step, l, h, t, ctx, sc, my_head_max, shifted, wt);
+        int32_t wt = softmax_exp_lookup((s_attn[h] >> SHIFT_ATTN) - (my_h_max >> SHIFT_ATTN));
+        EGG_TRACE_ATTN_PROBE(step, l, h, t, ctx, s_attn[h], my_h_max, 0, wt);
         EGG_TRACE_ATTN_ACCUM(attn_dbg, wt);
-        
-        ActType v_ctx = lkv_v[ctx*HIDDEN_DIM + tid];
-        w_v_sum += (AttnAccumType)wt * v_ctx;
-        tot_sc += wt;
+        w_v_sum += (AttnAccumType)wt * lkv_v[ctx*HIDDEN_DIM + tid]; tot_sc += wt;
         __syncthreads();
-        if(tid < N_HEADS) s_attn_scores[tid] = 0;
+        if(tid < N_HEADS) s_attn[tid] = 0;
         __syncthreads();
     }
     EGG_TRACE_ATTN_FINISH(attn_dbg, step, l, h, t);
-    
-    if(tot_sc==0) tot_sc=1;
-    ActType ao = clip(w_v_sum / (int64_t)tot_sc);
+    ActType ao = clip(w_v_sum / (tot_sc ? (int64_t)tot_sc : 1));
     s_norm[tid] = ao; __syncthreads();
 
     // Out Proj
-    AccumType sbo = block_reduce_sum_broadcast((AccumType)ao * noise_from_hash(seed_base + SEED_OFF_O_B, tid), temp_storage, shared_scalar);
-    AccumType aco = compute_linear_projection((int32_t*)s_norm, (const int32_t*)model->w_o[l], HIDDEN_DIM/4, HIDDEN_DIM, tid, sbo, seed_base + SEED_OFF_O_A, ns);
-    AccumType attn_res = (AccumType)s_x[tid] + (aco >> SHIFT_OUT);
-    s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(attn_res, tid, warp_maxs_scratch); __syncthreads();
-    
+    AccumType sb = block_reduce_sum_broadcast((AccumType)ao * noise_from_hash(seed_base + SEED_OFF_O_B, tid), temp_storage, shared_scalar);
+    AccumType aco = compute_linear_projection((int32_t*)s_norm, (const int32_t*)model->w_o[l], HIDDEN_DIM/4, HIDDEN_DIM, tid, sb, seed_base + SEED_OFF_O_A, ns);
+    s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>((AccumType)s_x[tid] + (aco >> SHIFT_OUT), tid, w_max);
+    __syncthreads();
     if(step != -1) EGG_TRACE_STAT(step, t, l, "Attn", s_x, HIDDEN_DIM);
+}
 
-    // 4. MLP
-    s_norm[tid] = apply_standard_norm(
-        s_x[tid], tid, temp_storage, shared_scalar,
-        model->ln_2[l][tid], model->ln_2_bias[l][tid],
-        seed_base, SEED_OFF_LN_2, SEED_OFF_LN_2_BIAS, ns
-    );
-    __syncthreads();
-    if(step != -1) EGG_TRACE_STAT(step, t, l, "LN2", s_norm, HIDDEN_DIM);
-
-    AccumType sbup = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + SEED_OFF_MLP_UP_B, tid), temp_storage, shared_scalar);
-    
-    ActType *s_mlp = &s_mem[2*HIDDEN_DIM + 256];
-    const int32_t *wup_p = (const int32_t*)model->w_up[l];
-    int32_t *v_ptr_up = (int32_t*)s_norm;
-    for(int sub=0; sub<4; sub++) {
-        int oidx = tid + sub*HIDDEN_DIM;
-        AccumType aup = compute_linear_projection(v_ptr_up, wup_p, HIDDEN_DIM/4, 4*HIDDEN_DIM, oidx, sbup, seed_base + SEED_OFF_MLP_UP_A, ns);
-        
-        WeightType b_up = model->mlp_bias_up[l][oidx];
-        int8_t n_b_up = noise_from_hash(seed_base + SEED_OFF_MLP_BIAS_UP, oidx);
-        ActType raw = clip((aup>>SHIFT_MLP_UP) + b_up + (((AccumType)n_b_up * ns) >> SIGMA_SHIFT_VECTOR)); 
-        s_mlp[oidx] = d_ACT_LUT[(uint8_t)raw];
-    }
-    __syncthreads();
-    if(step != -1) EGG_TRACE_STAT(step, t, l, "MLP_Exp", s_mlp, 4*HIDDEN_DIM);
-
-    AccumType pbdn = 0;
-    for(int sub=0; sub<4; sub++) pbdn += (AccumType)s_mlp[tid + sub*HIDDEN_DIM] * noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_B, tid + sub*HIDDEN_DIM);
-    AccumType sbdn = block_reduce_sum_broadcast(pbdn, temp_storage, shared_scalar);
-
-    const int32_t *wdn_p = (const int32_t*)model->w_down[l];
-    AccumType adn = compute_linear_projection((int32_t*)s_mlp, wdn_p, HIDDEN_DIM, HIDDEN_DIM, tid, sbdn, seed_base + SEED_OFF_MLP_DOWN_A, ns);
-
-    WeightType b_dn = model->mlp_bias_down[l][tid];
-    int8_t n_b_dn = noise_from_hash(seed_base + SEED_OFF_MLP_BIAS_DOWN, tid);
-    
-    AccumType mlp_res = (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + b_dn + (((AccumType)n_b_dn * ns) >> SIGMA_SHIFT_VECTOR);
-    s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(mlp_res, tid, warp_maxs_scratch); __syncthreads();
-    
-    if(step != -1) EGG_TRACE_STAT(step, t, l, "MLP", s_x, HIDDEN_DIM);
+__device__ void compute_transformer_layer(
+    int l, int t, int tid,
+    const TransformerModel * __restrict__ model,
+    ActType *lkv_k, ActType *lkv_v,
+    ActType *s_x, ActType *s_mem,
+    BlockReduce::TempStorage &temp_storage, AccumType &shared_scalar,
+    uint32_t seed_base, int ns, long step, int global_pop_offset
+) {
+    compute_attention(l, t, tid, model, lkv_k, lkv_v, s_x, s_mem, temp_storage, shared_scalar, seed_base, ns, step, global_pop_offset);
+    compute_mlp(l, t, tid, s_x, s_mem, temp_storage, shared_scalar, model->ln_2[l], model->ln_2_bias[l], model->w_up[l], model->mlp_bias_up[l], model->w_down[l], model->mlp_bias_down[l], seed_base, ns, step, global_pop_offset, CFG_MLP_LAYER);
 }
 
 __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
@@ -667,59 +661,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         __syncthreads();
         EGG_TRACE_STAT(step, t, -1, "Emb", s_x, HIDDEN_DIM);
 
-        // --- INITIAL MLP BLOCK ---
-        // Norm Init (With Bias)
-        ActType *s_norm_init = &s_mem[HIDDEN_DIM];
-        s_norm_init[tid] = apply_standard_norm(
-            s_x[tid], tid, temp_storage, shared_scalar,
-            model->ln_init[tid], model->ln_init_bias[tid],
-            step_seed + pair_idx, SEED_OFF_LN_INIT, SEED_OFF_LN_INIT_BIAS, ns
-        );
-        __syncthreads();
-        EGG_TRACE_STAT(step, t, -1, "LN_Init", s_norm_init, HIDDEN_DIM);
-
-        // Expand
-        AccumType sbiup = block_reduce_sum_broadcast((AccumType)s_norm_init[tid] * noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_MLP_UP_B, tid), temp_storage, shared_scalar);
-        
-        // Reuse large scratchpad area for MLP acts
-        ActType *s_mlp_init = &s_mem[2*HIDDEN_DIM + 256]; 
-
-        const int32_t *wiup_p = (const int32_t*)model->w_emb_mlp_up;
-        int32_t *v_ptr_iup = (int32_t*)s_norm_init;
-        
-        for(int sub=0; sub<4; sub++) {
-            int oidx = tid + sub*HIDDEN_DIM;
-            AccumType aup = compute_linear_projection(v_ptr_iup, wiup_p, HIDDEN_DIM/4, 4*HIDDEN_DIM, oidx, sbiup, (step_seed + pair_idx) + SEED_OFF_EMB_MLP_UP_A, ns);
-            
-            WeightType b_up = model->mlp_emb_bias_up[oidx];
-            int8_t n_b_up = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_MLP_BIAS_UP, oidx);
-            
-            ActType raw = clip((aup>>SHIFT_MLP_UP) + b_up + (((AccumType)n_b_up * ns) >> SIGMA_SHIFT_VECTOR)); 
-            s_mlp_init[oidx] = d_ACT_LUT[(uint8_t)raw]; // GELU
-        }
-        __syncthreads();
-        EGG_TRACE_STAT(step, t, -1, "InitMLP_Exp", s_mlp_init, 4*HIDDEN_DIM);
-
-        AccumType pbidn = 0;
-        for(int sub=0; sub<4; sub++) pbidn += (AccumType)s_mlp_init[tid + sub*HIDDEN_DIM] * noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_MLP_DOWN_B, tid + sub*HIDDEN_DIM);
-        AccumType sbidn = block_reduce_sum_broadcast(pbidn, temp_storage, shared_scalar);
-
-        const int32_t *widn_p = (const int32_t*)model->w_emb_mlp_down;
-        int32_t *v_ptr_idn = (int32_t*)s_mlp_init;
-        AccumType aidn = compute_linear_projection(v_ptr_idn, widn_p, HIDDEN_DIM, HIDDEN_DIM, tid, sbidn, (step_seed + pair_idx) + SEED_OFF_EMB_MLP_DOWN_A, ns);
-
-        // Add MLP Bias Down
-        WeightType b_idn = model->mlp_emb_bias_down[tid];
-        int8_t n_b_idn = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_MLP_BIAS_DOWN, tid);
-        
-        // Adaptive Layer Norm for Initial MLP Residual
-        // Reuse scratch/warp maxs buffer which is free here
-        int32_t *warp_maxs_scratch_init = (int32_t*)&s_mem[2*HIDDEN_DIM];
-        AccumType imlp_res = (AccumType)s_x[tid] + (aidn >> SHIFT_MLP_DOWN) + b_idn + (((AccumType)n_b_idn * ns) >> SIGMA_SHIFT_VECTOR);
-        s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(imlp_res, tid, warp_maxs_scratch_init); __syncthreads();
-        
-        EGG_TRACE_STAT(step, t, -1, "InitMLP", s_x, HIDDEN_DIM);
-        // ---------------------
+        compute_mlp(0, t, tid, s_x, s_mem, temp_storage, shared_scalar, model->ln_init, model->ln_init_bias, model->w_emb_mlp_up, model->mlp_emb_bias_up, model->w_emb_mlp_down, model->mlp_emb_bias_down, step_seed + pair_idx, ns, step, global_pop_offset, CFG_MLP_INIT);
 
         // 2. Stack
         for (int l = 0; l < N_LAYERS; l++) {
@@ -820,6 +762,32 @@ __global__ void compute_fitness_kernel(const int32_t *accum_loss, int32_t *fitne
 
 // ADAM W Implementation KERNELS
 
+__device__ __forceinline__ void apply_adam_update(
+    AdamParam &p,
+    WeightType &w,
+    float g,
+    float learning_rate,
+    int &change
+) {
+    // Update Moments
+    p.m = ADAM_BETA1 * p.m + (1.0f - ADAM_BETA1) * g;
+    p.v = ADAM_BETA2 * p.v + (1.0f - ADAM_BETA2) * (g * g);
+    
+    float step = - learning_rate * (p.m / (sqrtf(p.v) + ADAM_EPS) + ADAM_WEIGHT_DECAY * (float)w);
+    
+    // Accumulate
+    p.acc += step;
+    
+    // Apply to Integer Weight
+    if (p.acc >= 1.0f) {
+        if (w < MAX_VAL) { w++; change=1; p.acc -= 1.0f; }
+        else p.acc = 1.0f; // Clamp accumulator
+    } else if (p.acc <= -1.0f) {
+            if (w > MIN_VAL) { w--; change=1; p.acc += 1.0f; }
+            else p.acc = -1.0f; // Clamp accumulator
+    }
+}
+
 // update_matrix_adam_kernel
 __global__ void update_matrix_adam_kernel(
     WeightType *W, 
@@ -854,36 +822,11 @@ __global__ void update_matrix_adam_kernel(
             vote += (VoteType)fit * noise_from_hash(s + off_A, tid) * noise_from_hash(s + off_B, k);
         }
         
-        float g = -(float)vote; 
-
-        // Load Adam State
+        WeightType w = W[idx];
         AdamParam p = adam_state[idx];
-        
-        // Update Moments
-        p.m = ADAM_BETA1 * p.m + (1.0f - ADAM_BETA1) * g;
-        p.v = ADAM_BETA2 * p.v + (1.0f - ADAM_BETA2) * (g * g);
-        
-        float m_hat = p.m; // / (1 - beta1^t)
-        float v_hat = p.v; // / (1 - beta2^t)
-        
-        // Update Step
-        float step = - learning_rate * (m_hat / (sqrtf(v_hat) + ADAM_EPS) + ADAM_WEIGHT_DECAY * (float)W[idx]);
-        
-        // Accumulate
-        p.acc += step;
-        
-        // Apply to Integer Weight
-        int8_t w = W[idx];
-        if (p.acc >= 1.0f) {
-            if (w < MAX_VAL) { w++; change=1; p.acc -= 1.0f; }
-            else p.acc = 1.0f; // Clamp accumulator
-        } else if (p.acc <= -1.0f) {
-             if (w > MIN_VAL) { w--; change=1; p.acc += 1.0f; }
-             else p.acc = -1.0f; // Clamp accumulator
-        }
-        
+        apply_adam_update(p, w, -(float)vote, learning_rate, change);
         W[idx] = w;
-        adam_state[idx] = p; // Write back state
+        adam_state[idx] = p;
     }
 
     if (change) atomicAdd(&s_count, 1);
@@ -917,25 +860,9 @@ __global__ void update_vector_adam_kernel(
             vote += (VoteType)fit * noise_from_hash(step_seed + p + seed_base + off_A, idx);
         }
         
-        float g = -(float)vote;
+        WeightType v_val = V[idx];
         AdamParam p = adam_state[idx];
-        
-        p.m = ADAM_BETA1 * p.m + (1.0f - ADAM_BETA1) * g;
-        p.v = ADAM_BETA2 * p.v + (1.0f - ADAM_BETA2) * (g * g);
-        
-        float step = - learning_rate * (p.m / (sqrtf(p.v) + ADAM_EPS) + ADAM_WEIGHT_DECAY * (float)V[idx]);
-        
-        p.acc += step;
-        
-        int8_t v_val = V[idx];
-        if (p.acc >= 1.0f) {
-            if (v_val < MAX_VAL) { v_val++; change=1; p.acc -= 1.0f; }
-            else p.acc = 1.0f;
-        } else if (p.acc <= -1.0f) {
-            if (v_val > MIN_VAL) { v_val--; change=1; p.acc += 1.0f; }
-            else p.acc = -1.0f;
-        }
-        
+        apply_adam_update(p, v_val, -(float)vote, learning_rate, change);
         V[idx] = v_val;
         adam_state[idx] = p;
     }
@@ -977,39 +904,7 @@ __global__ void generate_sequence_kernel(
         s_x[tid] = clip((AccumType)emb + ebias);
         __syncthreads();
 
-        // --- INITIAL MLP BLOCK (Gen) ---
-        // Norm 
-        ActType *s_norm_init = &s_mem[HIDDEN_DIM];
-        s_norm_init[tid] = apply_standard_norm(
-            s_x[tid], tid, temp_storage, shared_scalar,
-            model->ln_init[tid], model->ln_init_bias[tid],
-            0, 0, 0, 0
-        );
-        __syncthreads();
-
-        // Expand
-        ActType *s_mlp_init = &s_mem[2*HIDDEN_DIM + 256]; 
-        const int32_t *wiup_p = (const int32_t*)model->w_emb_mlp_up;
-        int32_t *v_ptr_iup = (int32_t*)s_norm_init;
-        for(int sub=0; sub<4; sub++) {
-            int oidx = tid + sub*HIDDEN_DIM;
-            AccumType aup = compute_linear_projection(v_ptr_iup, wiup_p, HIDDEN_DIM/4, 4*HIDDEN_DIM, oidx, 0, 0, 0);
-            WeightType b_up = model->mlp_emb_bias_up[oidx];
-            ActType raw = clip((aup>>SHIFT_MLP_UP) + b_up); 
-            s_mlp_init[oidx] = d_ACT_LUT[(uint8_t)raw];
-        }
-        __syncthreads();
-
-        // Contract
-        const int32_t *widn_p = (const int32_t*)model->w_emb_mlp_down;
-        int32_t *v_ptr_idn = (int32_t*)s_mlp_init;
-        AccumType aidn = compute_linear_projection(v_ptr_idn, widn_p, HIDDEN_DIM, HIDDEN_DIM, tid, 0, 0, 0);
-        WeightType b_idn = model->mlp_emb_bias_down[tid];
-        
-        int32_t *warp_maxs_scratch_init = (int32_t*)&s_mem[2*HIDDEN_DIM];
-        AccumType imlp_res = (AccumType)s_x[tid] + (aidn >> SHIFT_MLP_DOWN) + b_idn;
-        s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(imlp_res, tid, warp_maxs_scratch_init); __syncthreads();
-        // ------------------------------
+        compute_mlp(0, t, tid, s_x, s_mem, temp_storage, shared_scalar, model->ln_init, model->ln_init_bias, model->w_emb_mlp_up, model->mlp_emb_bias_up, model->w_emb_mlp_down, model->mlp_emb_bias_down, 0, 0, -1, 0, CFG_MLP_INIT);
 
         // 2. Layers
         for (int l = 0; l < N_LAYERS; l++) {
@@ -1174,46 +1069,56 @@ int main() {
         CHECK_CUDA(cudaMemset(d_updates_ptr, 0, sizeof(unsigned long long)));
 
         // Adam Updates
+#define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
+    update_matrix_adam_kernel<<< (ROWS*COLS+511)/512, 512 >>>( \
+    (WeightType*)M_PTR, (AdamParam*)ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, \
+    BASE, d_fit, seed, current_lr)
+
+#define LAUNCH_ADAM_VECTOR(V_PTR, ADAM_PTR, LEN, SEED_A, BASE, LR_SCALE) \
+    update_vector_adam_kernel<<< (LEN+255)/256, 256 >>>( \
+    (WeightType*)V_PTR, (AdamParam*)ADAM_PTR, LEN, SEED_A, \
+    BASE, d_fit, seed, current_lr * LR_SCALE)
+
         float current_lr = get_learning_rate(step);
         for(int l=0; l<N_LAYERS; l++) {
             int s_base = l * 1000;
-            int d2 = HIDDEN_DIM*HIDDEN_DIM;
             
-            update_matrix_adam_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_q[l], (AdamParam*)d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base, d_fit, seed, current_lr);
-            update_matrix_adam_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_k[l], (AdamParam*)d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base, d_fit, seed, current_lr);
-            update_matrix_adam_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_v[l], (AdamParam*)d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base, d_fit, seed, current_lr);
-            update_matrix_adam_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_o[l], (AdamParam*)d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base, d_fit, seed, current_lr);
+            LAUNCH_ADAM_MATRIX(d_model->w_q[l], d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base);
+            LAUNCH_ADAM_MATRIX(d_model->w_k[l], d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base);
+            LAUNCH_ADAM_MATRIX(d_model->w_v[l], d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base);
+            LAUNCH_ADAM_MATRIX(d_model->w_o[l], d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base);
             
-            update_matrix_adam_kernel<<< (HIDDEN_DIM*4*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_up[l], (AdamParam*)d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base, d_fit, seed, current_lr);
-            update_matrix_adam_kernel<<< (4*HIDDEN_DIM*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_down[l], (AdamParam*)d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base, d_fit, seed, current_lr);
+            LAUNCH_ADAM_MATRIX(d_model->w_up[l], d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base);
+            LAUNCH_ADAM_MATRIX(d_model->w_down[l], d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base);
             
-            update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_1[l], (AdamParam*)d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1, s_base, d_fit, seed, current_lr);
-            update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_1_bias[l], (AdamParam*)d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS, s_base, d_fit, seed, current_lr);
+            LAUNCH_ADAM_VECTOR(d_model->ln_1[l], d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1, s_base, 1.0f);
+            LAUNCH_ADAM_VECTOR(d_model->ln_1_bias[l], d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS, s_base, 1.0f);
             
-            update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_2[l], (AdamParam*)d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2, s_base, d_fit, seed, current_lr);
-            update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_2_bias[l], (AdamParam*)d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS, s_base, d_fit, seed, current_lr);
+            LAUNCH_ADAM_VECTOR(d_model->ln_2[l], d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2, s_base, 1.0f);
+            LAUNCH_ADAM_VECTOR(d_model->ln_2_bias[l], d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS, s_base, 1.0f);
             
-            update_vector_adam_kernel<<< (4*HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->mlp_bias_up[l], (AdamParam*)d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP, s_base, d_fit, seed, current_lr);
-            update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->mlp_bias_down[l], (AdamParam*)d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN, s_base, d_fit, seed, current_lr);
+            LAUNCH_ADAM_VECTOR(d_model->mlp_bias_up[l], d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP, s_base, 1.0f);
+            LAUNCH_ADAM_VECTOR(d_model->mlp_bias_down[l], d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN, s_base, 1.0f);
         }
         
-        update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_f, (AdamParam*)d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, d_fit, seed, current_lr);
-        update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_f_bias, (AdamParam*)d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS, 0, d_fit, seed, current_lr);
-        // Head update removed (shared with embedding)
+        LAUNCH_ADAM_VECTOR(d_model->ln_f, d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, 1.0f);
+        LAUNCH_ADAM_VECTOR(d_model->ln_f_bias, d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS, 0, 1.0f);
         
         // Initial MLP Updates
-        update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_init, (AdamParam*)d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT, 0, d_fit, seed, current_lr);
-        update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_init_bias, (AdamParam*)d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS, 0, d_fit, seed, current_lr);
+        LAUNCH_ADAM_VECTOR(d_model->ln_init, d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT, 0, 1.0f);
+        LAUNCH_ADAM_VECTOR(d_model->ln_init_bias, d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS, 0, 1.0f);
 
-        update_matrix_adam_kernel<<< (HIDDEN_DIM*4*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_emb_mlp_up, (AdamParam*)d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0, d_fit, seed, current_lr);
-        update_vector_adam_kernel<<< (4*HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->mlp_emb_bias_up, (AdamParam*)d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP, 0, d_fit, seed, current_lr);
+        LAUNCH_ADAM_MATRIX(d_model->w_emb_mlp_up, d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0);
+        LAUNCH_ADAM_VECTOR(d_model->mlp_emb_bias_up, d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP, 0, 1.0f);
 
-        update_matrix_adam_kernel<<< (4*HIDDEN_DIM*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_emb_mlp_down, (AdamParam*)d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0, d_fit, seed, current_lr);
-        update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->mlp_emb_bias_down, (AdamParam*)d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN, 0, d_fit, seed, current_lr);
+        LAUNCH_ADAM_MATRIX(d_model->w_emb_mlp_down, d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0);
+        LAUNCH_ADAM_VECTOR(d_model->mlp_emb_bias_down, d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN, 0, 1.0f);
 
-
-        update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->emb_bias, (AdamParam*)d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS, 0, d_fit, seed, current_lr*0.1); 
-        update_matrix_adam_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((WeightType*)d_model->embedding, (AdamParam*)d_adam_state->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, current_lr);
+        LAUNCH_ADAM_VECTOR(d_model->emb_bias, d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS, 0, 0.1f); 
+        LAUNCH_ADAM_MATRIX(d_model->embedding, d_adam_state->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0);
+        
+#undef LAUNCH_ADAM_MATRIX
+#undef LAUNCH_ADAM_VECTOR
         // RoPE: Removed pos_emb update
 
         CHECK_CUDA(cudaDeviceSynchronize());
