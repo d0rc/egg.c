@@ -30,9 +30,9 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 512
+#define HIDDEN_DIM 256
 #define HEAD_DIM 64
-#define N_LAYERS 4
+#define N_LAYERS 12
 #define SEQ_LEN 128     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
@@ -41,7 +41,7 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 5)
+#define POPULATION_BATCH_SIZE (8192 * 3)
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 1)
 
 #define FIXED_POINT 4
@@ -104,7 +104,7 @@ void handle_sigint(int sig) {
 
 // ADAM HYPERPARAMS
 float get_learning_rate(long step) {
-    if (step > 1000) {
+    if (step > 200) {
         return 0.01f;
     }
     return 0.1f;
@@ -432,6 +432,191 @@ __device__ __forceinline__ AccumType apply_rope_integer(AccumType val, int t, in
     return (AccumType)res;
 }
 
+__device__ __forceinline__ ActType apply_standard_norm(
+    ActType val, 
+    int tid, 
+    BlockReduce::TempStorage &storage, 
+    AccumType &shared_scalar,
+    WeightType w, 
+    WeightType b,
+    uint32_t seed_base, 
+    int off_w, 
+    int off_b, 
+    int ns
+) {
+    AccumType x = (AccumType)val;
+    AccumType tot = block_reduce_sum_broadcast(abs(x), storage, shared_scalar);
+    AccumType mn = tot / HIDDEN_DIM; 
+    if(!mn) mn = 1;
+
+    AccumType w_mod = w;
+    AccumType b_mod = b;
+
+    if (ns != 0) {
+        int8_t wn = noise_from_hash(seed_base + off_w, tid);
+        w_mod += ((AccumType)wn * ns) >> SIGMA_SHIFT_VECTOR;
+        
+        int8_t bn = noise_from_hash(seed_base + off_b, tid);
+        b_mod += ((AccumType)bn * ns) >> SIGMA_SHIFT_VECTOR;
+    }
+
+    return clip( (x * w_mod) / mn + b_mod );
+}
+
+__device__ void compute_transformer_layer(
+    int l, int t, int tid,
+    const TransformerModel * __restrict__ model,
+    ActType * __restrict__ lkv_k, 
+    ActType * __restrict__ lkv_v,
+    ActType *s_x,
+    ActType *s_mem,
+    BlockReduce::TempStorage &temp_storage,
+    AccumType &shared_scalar,
+    uint32_t seed_base,
+    int ns,
+    long step, // For tracing (-1 if generation)
+    int global_pop_offset
+) {
+    ActType *s_norm = &s_mem[HIDDEN_DIM];
+    
+    // 1. LN 1
+    s_norm[tid] = apply_standard_norm(
+        s_x[tid], tid, temp_storage, shared_scalar,
+        model->ln_1[l][tid], model->ln_1_bias[l][tid],
+        seed_base, SEED_OFF_LN_1, SEED_OFF_LN_1_BIAS, ns
+    );
+    __syncthreads();
+    
+    if(step != -1) EGG_TRACE_STAT(step, t, l, "LN1", s_norm, HIDDEN_DIM);
+
+    // 2. QKV
+    AccumType sbq = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + SEED_OFF_Q_B, tid), temp_storage, shared_scalar);
+    AccumType sbk = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + SEED_OFF_K_B, tid), temp_storage, shared_scalar);
+    AccumType sbv = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + SEED_OFF_V_B, tid), temp_storage, shared_scalar);
+
+    int32_t *v_ptr = (int32_t*)s_norm;
+    AccumType aq, ak, av;
+    compute_qkv_projection(v_ptr, (const int32_t*)model->w_q[l], (const int32_t*)model->w_k[l], (const int32_t*)model->w_v[l],
+                           HIDDEN_DIM/4, HIDDEN_DIM, tid, aq, ak, av, sbq, sbk, sbv, seed_base, ns);
+
+    aq = apply_rope_integer(aq, t, tid);
+    ak = apply_rope_integer(ak, t, tid);
+
+    int32_t *warp_maxs_scratch = (int32_t*)&s_mem[2*HIDDEN_DIM];
+    ActType qv = adaptive_qkv_normalize<BLOCK_THREADS/32>(aq, tid, warp_maxs_scratch);
+    ActType kv = adaptive_qkv_normalize<BLOCK_THREADS/32>(ak, tid, warp_maxs_scratch);
+    ActType vv = adaptive_qkv_normalize<BLOCK_THREADS/32>(av, tid, warp_maxs_scratch);
+
+    lkv_k[t*HIDDEN_DIM + tid] = kv;
+    lkv_v[t*HIDDEN_DIM + tid] = vv;
+    __syncthreads();
+
+    // 3. Attention
+    int h = tid / HEAD_DIM;
+    int32_t *s_attn_scores = (int32_t*)&s_mem[2*HIDDEN_DIM];
+    int32_t *s_head_max = (int32_t*)&s_mem[2*HIDDEN_DIM + N_HEADS*4];
+    
+    if(tid < N_HEADS) { s_attn_scores[tid] = 0; s_head_max[tid] = INT_MIN; }
+    __syncthreads();
+
+    // Pass 1: Max
+    for(int ctx=0; ctx <= t; ctx++) {
+        ActType k_ctx = lkv_k[ctx*HIDDEN_DIM + tid];
+        AccumType df = (AccumType)qv * k_ctx;
+        for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
+        if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
+        __syncthreads();
+        if (tid < N_HEADS) { atomicMax(&s_head_max[tid], s_attn_scores[tid]); s_attn_scores[tid] = 0; }
+        __syncthreads();
+    }
+
+    // Pass 2: Sum
+    AttnAccumType w_v_sum = 0;
+    uint64_t tot_sc = 0;
+    int32_t my_head_max = s_head_max[h];
+    if(tid < N_HEADS) s_attn_scores[tid] = 0;
+    __syncthreads();
+    
+    EGG_TRACE_ATTN_DECL(attn_dbg);
+    EGG_TRACE_ATTN_INIT(attn_dbg);
+
+    for(int ctx=0; ctx <= t; ctx++) {
+        ActType k_ctx = lkv_k[ctx*HIDDEN_DIM + tid];
+        AccumType df = (AccumType)qv * k_ctx;
+        for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
+        if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
+        __syncthreads();
+
+        int32_t sc = s_attn_scores[h];
+        int32_t shifted = (sc >> SHIFT_ATTN) - (my_head_max >> SHIFT_ATTN);
+        int32_t wt = softmax_exp_lookup(shifted);
+        
+        EGG_TRACE_ATTN_PROBE(step, l, h, t, ctx, sc, my_head_max, shifted, wt);
+        EGG_TRACE_ATTN_ACCUM(attn_dbg, wt);
+        
+        ActType v_ctx = lkv_v[ctx*HIDDEN_DIM + tid];
+        w_v_sum += (AttnAccumType)wt * v_ctx;
+        tot_sc += wt;
+        __syncthreads();
+        if(tid < N_HEADS) s_attn_scores[tid] = 0;
+        __syncthreads();
+    }
+    EGG_TRACE_ATTN_FINISH(attn_dbg, step, l, h, t);
+    
+    if(tot_sc==0) tot_sc=1;
+    ActType ao = clip(w_v_sum / (int64_t)tot_sc);
+    s_norm[tid] = ao; __syncthreads();
+
+    // Out Proj
+    AccumType sbo = block_reduce_sum_broadcast((AccumType)ao * noise_from_hash(seed_base + SEED_OFF_O_B, tid), temp_storage, shared_scalar);
+    AccumType aco = compute_linear_projection((int32_t*)s_norm, (const int32_t*)model->w_o[l], HIDDEN_DIM/4, HIDDEN_DIM, tid, sbo, seed_base + SEED_OFF_O_A, ns);
+    AccumType attn_res = (AccumType)s_x[tid] + (aco >> SHIFT_OUT);
+    s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(attn_res, tid, warp_maxs_scratch); __syncthreads();
+    
+    if(step != -1) EGG_TRACE_STAT(step, t, l, "Attn", s_x, HIDDEN_DIM);
+
+    // 4. MLP
+    s_norm[tid] = apply_standard_norm(
+        s_x[tid], tid, temp_storage, shared_scalar,
+        model->ln_2[l][tid], model->ln_2_bias[l][tid],
+        seed_base, SEED_OFF_LN_2, SEED_OFF_LN_2_BIAS, ns
+    );
+    __syncthreads();
+    if(step != -1) EGG_TRACE_STAT(step, t, l, "LN2", s_norm, HIDDEN_DIM);
+
+    AccumType sbup = block_reduce_sum_broadcast((AccumType)s_norm[tid] * noise_from_hash(seed_base + SEED_OFF_MLP_UP_B, tid), temp_storage, shared_scalar);
+    
+    ActType *s_mlp = &s_mem[2*HIDDEN_DIM + 256];
+    const int32_t *wup_p = (const int32_t*)model->w_up[l];
+    int32_t *v_ptr_up = (int32_t*)s_norm;
+    for(int sub=0; sub<4; sub++) {
+        int oidx = tid + sub*HIDDEN_DIM;
+        AccumType aup = compute_linear_projection(v_ptr_up, wup_p, HIDDEN_DIM/4, 4*HIDDEN_DIM, oidx, sbup, seed_base + SEED_OFF_MLP_UP_A, ns);
+        
+        WeightType b_up = model->mlp_bias_up[l][oidx];
+        int8_t n_b_up = noise_from_hash(seed_base + SEED_OFF_MLP_BIAS_UP, oidx);
+        ActType raw = clip((aup>>SHIFT_MLP_UP) + b_up + (((AccumType)n_b_up * ns) >> SIGMA_SHIFT_VECTOR)); 
+        s_mlp[oidx] = d_ACT_LUT[(uint8_t)raw];
+    }
+    __syncthreads();
+    if(step != -1) EGG_TRACE_STAT(step, t, l, "MLP_Exp", s_mlp, 4*HIDDEN_DIM);
+
+    AccumType pbdn = 0;
+    for(int sub=0; sub<4; sub++) pbdn += (AccumType)s_mlp[tid + sub*HIDDEN_DIM] * noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_B, tid + sub*HIDDEN_DIM);
+    AccumType sbdn = block_reduce_sum_broadcast(pbdn, temp_storage, shared_scalar);
+
+    const int32_t *wdn_p = (const int32_t*)model->w_down[l];
+    AccumType adn = compute_linear_projection((int32_t*)s_mlp, wdn_p, HIDDEN_DIM, HIDDEN_DIM, tid, sbdn, seed_base + SEED_OFF_MLP_DOWN_A, ns);
+
+    WeightType b_dn = model->mlp_bias_down[l][tid];
+    int8_t n_b_dn = noise_from_hash(seed_base + SEED_OFF_MLP_BIAS_DOWN, tid);
+    
+    AccumType mlp_res = (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + b_dn + (((AccumType)n_b_dn * ns) >> SIGMA_SHIFT_VECTOR);
+    s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(mlp_res, tid, warp_maxs_scratch); __syncthreads();
+    
+    if(step != -1) EGG_TRACE_STAT(step, t, l, "MLP", s_x, HIDDEN_DIM);
+}
+
 __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     const uint8_t * __restrict__ dataset, long data_len, int start_idx,
     const TransformerModel * __restrict__ model,
@@ -484,21 +669,17 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
         // --- INITIAL MLP BLOCK ---
         // Norm Init (With Bias)
-        AccumType mitot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-        AccumType mimn = mitot/HIDDEN_DIM; if(!mimn) mimn=1;
-        WeightType liw = model->ln_init[tid];
-        int8_t lin = noise_from_hash((step_seed + pair_idx) + SEED_OFF_LN_INIT, tid);
-        WeightType lib = model->ln_init_bias[tid];
-        int8_t libn = noise_from_hash((step_seed + pair_idx) + SEED_OFF_LN_INIT_BIAS, tid);
-        ActType nix = clip(((AccumType)s_x[tid] * (liw + (((AccumType)lin*ns)>>SIGMA_SHIFT_VECTOR))) / mimn
-                         + lib + (((AccumType)libn * ns) >> SIGMA_SHIFT_VECTOR)); 
-        // Reuse s_norm buffer (s_mem[HIDDEN_DIM])
         ActType *s_norm_init = &s_mem[HIDDEN_DIM];
-        s_norm_init[tid] = nix; __syncthreads();
+        s_norm_init[tid] = apply_standard_norm(
+            s_x[tid], tid, temp_storage, shared_scalar,
+            model->ln_init[tid], model->ln_init_bias[tid],
+            step_seed + pair_idx, SEED_OFF_LN_INIT, SEED_OFF_LN_INIT_BIAS, ns
+        );
+        __syncthreads();
         EGG_TRACE_STAT(step, t, -1, "LN_Init", s_norm_init, HIDDEN_DIM);
 
         // Expand
-        AccumType sbiup = block_reduce_sum_broadcast((AccumType)nix * noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_MLP_UP_B, tid), temp_storage, shared_scalar);
+        AccumType sbiup = block_reduce_sum_broadcast((AccumType)s_norm_init[tid] * noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_MLP_UP_B, tid), temp_storage, shared_scalar);
         
         // Reuse large scratchpad area for MLP acts
         ActType *s_mlp_init = &s_mem[2*HIDDEN_DIM + 256]; 
@@ -543,201 +724,27 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         // 2. Stack
         for (int l = 0; l < N_LAYERS; l++) {
             uint32_t seed_base = (step_seed + pair_idx) + (l * 1000);
-            ActType *s_norm = &s_mem[HIDDEN_DIM]; // Normalized buf
-
-            // LN 1 (With Bias)
-            AccumType total_sum = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-            AccumType mean = total_sum / HIDDEN_DIM; if(!mean) mean=1;
-            WeightType ln_w = model->ln_1[l][tid];
-            int8_t ln_n = noise_from_hash(seed_base + SEED_OFF_LN_1, tid);
-            WeightType ln_b = model->ln_1_bias[l][tid];
-            int8_t ln_bn = noise_from_hash(seed_base + SEED_OFF_LN_1_BIAS, tid);
-            ActType r_in = clip(((AccumType)s_x[tid] * (ln_w + (((AccumType)ln_n * ns) >> SIGMA_SHIFT_VECTOR))) / mean 
-                              + ln_b + (((AccumType)ln_bn * ns) >> SIGMA_SHIFT_VECTOR)); // Add bias
-            s_norm[tid] = r_in; __syncthreads();
-            EGG_TRACE_STAT(step, t, l, "LN1", s_norm, HIDDEN_DIM);
-
-            // QKV Projection (Rank-1 Fast)
-            AccumType sbq = block_reduce_sum_broadcast((AccumType)r_in * noise_from_hash(seed_base + SEED_OFF_Q_B, tid), temp_storage, shared_scalar);
-            AccumType sbk = block_reduce_sum_broadcast((AccumType)r_in * noise_from_hash(seed_base + SEED_OFF_K_B, tid), temp_storage, shared_scalar);
-            AccumType sbv = block_reduce_sum_broadcast((AccumType)r_in * noise_from_hash(seed_base + SEED_OFF_V_B, tid), temp_storage, shared_scalar);
-
-            // SIMD MatMul
-            int32_t *v_ptr = (int32_t*)s_norm;
-            const int32_t *wq_p = (const int32_t*)&model->w_q[l][0];
-            const int32_t *wk_p = (const int32_t*)&model->w_k[l][0];
-            const int32_t *wv_p = (const int32_t*)&model->w_v[l][0];
             
-            AccumType aq, ak, av;
-            compute_qkv_projection(v_ptr, wq_p, wk_p, wv_p, HIDDEN_DIM/4, HIDDEN_DIM, tid, aq, ak, av, sbq, sbk, sbv, seed_base, ns);
+            ActType* lkv_base = global_kv_cache + kv_ind_offset + (l * kv_layer_stride);
+            ActType* lkv_k = lkv_base;
+            ActType* lkv_v = lkv_base + SEQ_LEN*HIDDEN_DIM;
 
-            // Apply RoPE rotation to Q and K
-            aq = apply_rope_integer(aq, t, tid);
-            ak = apply_rope_integer(ak, t, tid);
-
-            // Adaptive QKV Normalization
-            // Reuse shared memory scratchpad at offset 2*HIDDEN_DIM (free at this point)
-            int32_t *warp_maxs_scratch = (int32_t*)&s_mem[2*HIDDEN_DIM];
-            ActType qv = adaptive_qkv_normalize<BLOCK_THREADS/32>(aq, tid, warp_maxs_scratch);
-            ActType kv = adaptive_qkv_normalize<BLOCK_THREADS/32>(ak, tid, warp_maxs_scratch);
-            ActType vv = adaptive_qkv_normalize<BLOCK_THREADS/32>(av, tid, warp_maxs_scratch);
-            
-            // Store KV
-            ActType *lkv = global_kv_cache + kv_ind_offset + (l * kv_layer_stride);
-            lkv[t*HIDDEN_DIM + tid] = kv;
-            lkv[SEQ_LEN*HIDDEN_DIM + t*HIDDEN_DIM + tid] = vv;
-            __syncthreads();
-
-            // Attention (Per Head) - Two-Pass with atomicMax for stability
-            int h = tid / HEAD_DIM;
-            int32_t *s_attn_scores = (int32_t*)&s_mem[2*HIDDEN_DIM]; // Per-head scores accumulator
-            int32_t *s_head_max = (int32_t*)&s_mem[2*HIDDEN_DIM + N_HEADS*4]; // Per-head max scores
-            
-            // Initialize per-head max to INT_MIN
-            if(tid < N_HEADS) {
-                s_attn_scores[tid] = 0;
-                s_head_max[tid] = INT_MIN;
-            }
-            __syncthreads();
-
-            // PASS 1: Compute all attention scores and find max per head using atomicMax
-            for(int ctx=0; ctx <= t; ctx++) {
-                ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
-                AccumType df = (AccumType)qv * k_ctx;
-                
-                // Reduce across head (Head Size 64, Warp 32)
-                for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
-                
-                // Lane 0 of each warp has partial sum
-                if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
-                __syncthreads();
-                
-                // Update max using atomicMax (CAS-based)
-                if (tid < N_HEADS) {
-                    atomicMax(&s_head_max[tid], s_attn_scores[tid]);
-                    s_attn_scores[tid] = 0; // Reset for next context
-                }
-                __syncthreads();
-            }
-            
-            AttnAccumType w_v_sum = 0;
-            uint64_t tot_sc = 0;
-            int32_t my_head_max = s_head_max[h];
-            
-            if(tid < N_HEADS) s_attn_scores[tid] = 0; // Reset for pass 2
-            __syncthreads();
-
-            EGG_TRACE_ATTN_DECL(attn_dbg);
-            EGG_TRACE_ATTN_INIT(attn_dbg);
-            
-            for(int ctx=0; ctx <= t; ctx++) {
-                ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
-                AccumType df = (AccumType)qv * k_ctx;
-                
-                // Reduce across head
-                for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
-                
-                if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
-                __syncthreads();
-                
-                // Compute weight using new softmax LUT with max subtraction
-                int32_t sc = s_attn_scores[h];
-                int32_t shifted = (sc >> SHIFT_ATTN) - (my_head_max >> SHIFT_ATTN); // Normalize by max. Scaled down.
-                int32_t wt = softmax_exp_lookup(shifted);
-                
-                EGG_TRACE_ATTN_PROBE(step, l, h, t, ctx, sc, my_head_max, shifted, wt);
-                EGG_TRACE_ATTN_ACCUM(attn_dbg, wt);
-
-                ActType v_ctx = lkv[SEQ_LEN*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
-                w_v_sum += (AttnAccumType)wt * v_ctx;
-                tot_sc += wt;
-                
-                __syncthreads();
-                if(tid < N_HEADS) s_attn_scores[tid] = 0; // Reset
-                __syncthreads();
-            }
-            EGG_TRACE_ATTN_FINISH(attn_dbg, step, l, h, t);
-
-            if(tot_sc==0) tot_sc=1;
-            // Scale down from 2^20 precision
-            ActType ao = clip((w_v_sum / (int64_t)tot_sc));
-            s_norm[tid] = ao; __syncthreads();
-
-            // Output Proj
-            AccumType sbo = block_reduce_sum_broadcast((AccumType)ao * noise_from_hash(seed_base + SEED_OFF_O_B, tid), temp_storage, shared_scalar);
-
-            const int32_t *wo_p = (const int32_t*)model->w_o[l];
-            int32_t *v_ptr_o = (int32_t*)s_norm;
-            AccumType aco = compute_linear_projection(v_ptr_o, wo_p, HIDDEN_DIM/4, HIDDEN_DIM, tid, sbo, seed_base + SEED_OFF_O_A, ns);
-            // UPDATE: Adaptive Layer Norm for Attention Residual
-            AccumType attn_res = (AccumType)s_x[tid] + (aco >> SHIFT_OUT);
-            s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(attn_res, tid, warp_maxs_scratch); __syncthreads();
-            
-            EGG_TRACE_STAT(step, t, l, "Attn", s_x, HIDDEN_DIM);
-
-            // MLP Block
-            // Norm 2 (With Bias)
-            AccumType mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-            AccumType mmn = mtot/HIDDEN_DIM; if(!mmn) mmn=1;
-            WeightType l2w = model->ln_2[l][tid];
-            int8_t l2n = noise_from_hash(seed_base + SEED_OFF_LN_2, tid);
-            WeightType l2b = model->ln_2_bias[l][tid];
-            int8_t l2bn = noise_from_hash(seed_base + SEED_OFF_LN_2_BIAS, tid);
-            ActType n2x = clip(((AccumType)s_x[tid] * (l2w + (((AccumType)l2n*ns)>>SIGMA_SHIFT_VECTOR))) / mmn
-                             + l2b + (((AccumType)l2bn * ns) >> SIGMA_SHIFT_VECTOR)); // Add bias
-            s_norm[tid] = n2x; __syncthreads();
-            EGG_TRACE_STAT(step, t, l, "LN2", s_norm, HIDDEN_DIM);
-
-            // Expand
-            AccumType sbup = block_reduce_sum_broadcast((AccumType)n2x * noise_from_hash(seed_base + SEED_OFF_MLP_UP_B, tid), temp_storage, shared_scalar);
-
-            ActType *s_mlp = &s_mem[2*HIDDEN_DIM + 256]; 
-
-            const int32_t *wup_p = (const int32_t*)model->w_up[l];
-            int32_t *v_ptr_up = (int32_t*)s_norm;
-            
-            for(int sub=0; sub<4; sub++) {
-                int oidx = tid + sub*HIDDEN_DIM;
-                AccumType aup = compute_linear_projection(v_ptr_up, wup_p, HIDDEN_DIM/4, 4*HIDDEN_DIM, oidx, sbup, seed_base + SEED_OFF_MLP_UP_A, ns);
-                
-                WeightType b_up = model->mlp_bias_up[l][oidx];
-                int8_t n_b_up = noise_from_hash(seed_base + SEED_OFF_MLP_BIAS_UP, oidx);
-                
-                ActType raw = clip((aup>>SHIFT_MLP_UP) + b_up + (((AccumType)n_b_up * ns) >> SIGMA_SHIFT_VECTOR)); 
-                s_mlp[oidx] = d_ACT_LUT[(uint8_t)raw]; // GELU
-            }
-            __syncthreads();
-            EGG_TRACE_STAT(step, t, l, "MLP_Exp", s_mlp, 4*HIDDEN_DIM);
-
-            AccumType pbdn = 0;
-            for(int sub=0; sub<4; sub++) pbdn += (AccumType)s_mlp[tid + sub*HIDDEN_DIM] * noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_B, tid + sub*HIDDEN_DIM);
-            AccumType sbdn = block_reduce_sum_broadcast(pbdn, temp_storage, shared_scalar);
-
-            const int32_t *wdn_p = (const int32_t*)model->w_down[l];
-            int32_t *v_ptr_dn = (int32_t*)s_mlp;
-            AccumType adn = compute_linear_projection(v_ptr_dn, wdn_p, HIDDEN_DIM, HIDDEN_DIM, tid, sbdn, seed_base + SEED_OFF_MLP_DOWN_A, ns);
-
-            // Add MLP Bias Down
-            WeightType b_dn = model->mlp_bias_down[l][tid];
-            int8_t n_b_dn = noise_from_hash(seed_base + SEED_OFF_MLP_BIAS_DOWN, tid);
-            
-            // UPDATE: Adaptive Layer Norm for MLP Residual
-            AccumType mlp_res = (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + b_dn + (((AccumType)n_b_dn * ns) >> SIGMA_SHIFT_VECTOR);
-            s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(mlp_res, tid, warp_maxs_scratch); __syncthreads();
-            
-            EGG_TRACE_STAT(step, t, l, "MLP", s_x, HIDDEN_DIM);
+            compute_transformer_layer(
+                l, t, tid, model, 
+                lkv_k, lkv_v,
+                s_x, s_mem, 
+                temp_storage, shared_scalar,
+                seed_base, ns, step,
+                global_pop_offset
+            );
         }
 
         // 3. Final Head
-        AccumType ftot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-        AccumType fmn = ftot/HIDDEN_DIM; if(!fmn) fmn=1;
-        
-        WeightType lfw = model->ln_f[tid];
-        int8_t lfn = noise_from_hash(step_seed + pair_idx + SEED_OFF_LN_F, tid);
-        WeightType lfb = model->ln_f_bias[tid];
-        int8_t lfbn = noise_from_hash(step_seed + pair_idx + SEED_OFF_LN_F_BIAS, tid);
-        ActType nf = clip(((AccumType)s_x[tid] * (lfw + (((AccumType)lfn*ns)>>SIGMA_SHIFT_VECTOR))) / fmn
-                        + lfb + (((AccumType)lfbn * ns) >> SIGMA_SHIFT_VECTOR));
+        ActType nf = apply_standard_norm(
+            s_x[tid], tid, temp_storage, shared_scalar,
+            model->ln_f[tid], model->ln_f_bias[tid],
+            step_seed + pair_idx, SEED_OFF_LN_F, SEED_OFF_LN_F_BIAS, ns
+        );
         
         // Reuse s_mem[HD] for normed
         ActType *s_norm = &s_mem[HIDDEN_DIM];
@@ -972,13 +979,13 @@ __global__ void generate_sequence_kernel(
 
         // --- INITIAL MLP BLOCK (Gen) ---
         // Norm 
-        AccumType mitot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-        AccumType mimn = mitot/HIDDEN_DIM; if(!mimn) mimn=1;
-        WeightType liw = model->ln_init[tid];
-        WeightType lib = model->ln_init_bias[tid];
-        ActType nix = clip(((AccumType)s_x[tid] * liw) / mimn + lib);
         ActType *s_norm_init = &s_mem[HIDDEN_DIM];
-        s_norm_init[tid] = nix; __syncthreads();
+        s_norm_init[tid] = apply_standard_norm(
+            s_x[tid], tid, temp_storage, shared_scalar,
+            model->ln_init[tid], model->ln_init_bias[tid],
+            0, 0, 0, 0
+        );
+        __syncthreads();
 
         // Expand
         ActType *s_mlp_init = &s_mem[2*HIDDEN_DIM + 256]; 
@@ -1006,142 +1013,26 @@ __global__ void generate_sequence_kernel(
 
         // 2. Layers
         for (int l = 0; l < N_LAYERS; l++) {
-            ActType *s_norm = &s_mem[HIDDEN_DIM];
+            ActType* lkv_base = kv_cache + (l * kv_layer_stride);
+            ActType* lkv_k = lkv_base;
+            ActType* lkv_v = lkv_base + total_len*HIDDEN_DIM;
 
-            // LN 1 (With Bias)
-            AccumType total_sum = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-            AccumType mean = total_sum / HIDDEN_DIM; if(!mean) mean=1;
-            WeightType ln_w = model->ln_1[l][tid];
-            WeightType ln_b = model->ln_1_bias[l][tid];
-            ActType r_in = clip(((AccumType)s_x[tid] * ln_w) / mean + ln_b);
-            s_norm[tid] = r_in; __syncthreads();
-
-            // QKV
-            int32_t *v_ptr = (int32_t*)s_norm;
-            const int32_t *wq_p = (const int32_t*)&model->w_q[l][0];
-            const int32_t *wk_p = (const int32_t*)&model->w_k[l][0];
-            const int32_t *wv_p = (const int32_t*)&model->w_v[l][0];
-            
-            AccumType aq, ak, av;
-            compute_qkv_projection(v_ptr, wq_p, wk_p, wv_p, HIDDEN_DIM/4, HIDDEN_DIM, tid, aq, ak, av, 0, 0, 0, 0, 0);
-            
-            // Apply RoPE rotation to Q and K
-            aq = apply_rope_integer(aq, t, tid);
-            ak = apply_rope_integer(ak, t, tid);
-
-            // Adaptive QKV Normalization
-            // Reuse shared memory scratchpad 
-            int32_t *warp_maxs_scratch = (int32_t*)&s_mem[2*HIDDEN_DIM];
-            ActType qv = adaptive_qkv_normalize<BLOCK_THREADS/32>(aq, tid, warp_maxs_scratch);
-            ActType kv = adaptive_qkv_normalize<BLOCK_THREADS/32>(ak, tid, warp_maxs_scratch);
-            ActType vv = adaptive_qkv_normalize<BLOCK_THREADS/32>(av, tid, warp_maxs_scratch);
-
-            // Store KV
-            ActType *lkv = kv_cache + (l * kv_layer_stride);
-            lkv[t*HIDDEN_DIM + tid] = kv;
-            lkv[total_len*HIDDEN_DIM + t*HIDDEN_DIM + tid] = vv;
-            __syncthreads();
-
-            // Attention - Two-Pass with max-subtraction for stability
-            int h = tid / HEAD_DIM;
-            int32_t *s_attn_scores = (int32_t*)&s_mem[2*HIDDEN_DIM];
-            int32_t *s_head_max = (int32_t*)&s_mem[2*HIDDEN_DIM + N_HEADS*4];
-            
-            if(tid < N_HEADS) {
-                s_attn_scores[tid] = 0;
-                s_head_max[tid] = INT_MIN;
-            }
-            __syncthreads();
-
-            // PASS 1: Find max score per head
-            for(int ctx=0; ctx <= t; ctx++) {
-                ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
-                AccumType df = (AccumType)qv * k_ctx;
-                for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
-                if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
-                __syncthreads();
-                
-                if (tid < N_HEADS) {
-                    atomicMax(&s_head_max[tid], s_attn_scores[tid]);
-                    s_attn_scores[tid] = 0;
-                }
-                __syncthreads();
-            }
-            
-            // PASS 2: Compute weighted sum with new softmax
-            AttnAccumType w_v_sum = 0;
-            uint64_t tot_sc = 0;
-            int32_t my_head_max = s_head_max[h];
-            
-            if(tid < N_HEADS) s_attn_scores[tid] = 0;
-            __syncthreads();
-
-            for(int ctx=0; ctx <= t; ctx++) {
-                ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
-                AccumType df = (AccumType)qv * k_ctx;
-                for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
-                if ((tid % 32) == 0) atomicAdd(&s_attn_scores[h], (int32_t)df);
-                __syncthreads();
-
-                int32_t sc = s_attn_scores[h];
-                int32_t shifted = (sc >> SHIFT_ATTN) - (my_head_max >> SHIFT_ATTN);
-                int32_t wt = softmax_exp_lookup(shifted);
-
-                ActType v_ctx = lkv[total_len*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
-                w_v_sum += (AttnAccumType)wt * v_ctx;
-                tot_sc += wt;
-                
-                __syncthreads();
-                if(tid < N_HEADS) s_attn_scores[tid] = 0;
-                __syncthreads();
-            }
-            if(tot_sc==0) tot_sc=1;
-            ActType ao = clip(w_v_sum / (int64_t)tot_sc);
-            s_norm[tid] = ao; __syncthreads();
-
-            // Output
-            const int32_t *wo_p = (const int32_t*)model->w_o[l];
-            int32_t *v_ptr_o = (int32_t*)s_norm;
-            AccumType aco = compute_linear_projection(v_ptr_o, wo_p, HIDDEN_DIM/4, HIDDEN_DIM, tid, 0, 0, 0);
-            // UPDATE: Adaptive Layer Norm for Attn Residual (Gen)
-            AccumType attn_res = (AccumType)s_x[tid] + (aco >> SHIFT_OUT);
-            s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(attn_res, tid, warp_maxs_scratch); __syncthreads();
-
-            // MLP
-            AccumType mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-            AccumType mmn = mtot/HIDDEN_DIM; if(!mmn) mmn=1;
-            WeightType l2w = model->ln_2[l][tid];
-            WeightType l2b = model->ln_2_bias[l][tid];
-            ActType n2x = clip(((AccumType)s_x[tid] * l2w) / mmn + l2b);
-            s_norm[tid] = n2x; __syncthreads();
-
-            ActType *s_mlp = &s_mem[2*HIDDEN_DIM + 256];
-            const int32_t *wup_p = (const int32_t*)model->w_up[l];
-            int32_t *v_ptr_up = (int32_t*)s_norm;
-            for(int sub=0; sub<4; sub++) {
-                int oidx = tid + sub*HIDDEN_DIM;
-                AccumType aup = compute_linear_projection(v_ptr_up, wup_p, HIDDEN_DIM/4, 4*HIDDEN_DIM, oidx, 0, 0, 0);
-                WeightType b_up = model->mlp_bias_up[l][oidx];
-                ActType raw = clip((aup>>SHIFT_MLP_UP) + b_up); 
-                s_mlp[oidx] = d_ACT_LUT[(uint8_t)raw];
-            }
-            __syncthreads();
-
-            const int32_t *wdn_p = (const int32_t*)model->w_down[l];
-            int32_t *v_ptr_dn = (int32_t*)s_mlp;
-            AccumType adn = compute_linear_projection(v_ptr_dn, wdn_p, HIDDEN_DIM, HIDDEN_DIM, tid, 0, 0, 0);
-            WeightType b_dn = model->mlp_bias_down[l][tid];
-            // UPDATE: Adaptive Layer Norm for MLP Residual (Gen)
-            AccumType mlp_res = (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + b_dn;
-            s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>(mlp_res, tid, warp_maxs_scratch); __syncthreads();
+            compute_transformer_layer(
+                l, t, tid, model, 
+                lkv_k, lkv_v,
+                s_x, s_mem, 
+                temp_storage, shared_scalar,
+                0, 0, -1, 
+                0
+            );
         }
 
         // Final Head
-        AccumType ftot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-        AccumType fmn = ftot/HIDDEN_DIM; if(!fmn) fmn=1;
-        WeightType lfw = model->ln_f[tid];
-        WeightType lfb = model->ln_f_bias[tid];
-        ActType nf = clip(((AccumType)s_x[tid] * lfw) / fmn + lfb);
+        ActType nf = apply_standard_norm(
+            s_x[tid], tid, temp_storage, shared_scalar,
+            model->ln_f[tid], model->ln_f_bias[tid],
+            0, 0, 0, 0
+        );
         ActType *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
 
