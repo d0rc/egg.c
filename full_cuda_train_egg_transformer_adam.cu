@@ -107,7 +107,7 @@ float get_learning_rate(long step) {
     if (step > 200) {
         return 0.01f;
     }
-    return 0.1f;
+    return 0.01f;
 }
 
 #define ADAM_BETA1 0.9f
