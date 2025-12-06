@@ -45,7 +45,7 @@ nvcc -O3 full_cuda_train_egg.cu -o egg_cuda
 <a id="int8nativeformer"></a>
 ### Int8NativeFormer (`full_cuda_train_transformer_adam_mgpu.cu`)
 
-An `int8` model optimized for bit-level operations.
+An `int8` model.
 
 *   **Native `int8` Architecture**: Operates on raw bytes with a compact `N`-layer, `H`-dim topology.
 *   **Quantized Sigmoid Self-Attention**: Replaces standard floating-point attention with a novel `int32` accumulation scheme and quantized weighting, specifically designed for discrete optimization.
