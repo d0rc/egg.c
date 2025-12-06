@@ -48,12 +48,14 @@ nvcc -O3 full_cuda_train_egg.cu -o egg_cuda
 An `int8` model.
 
 *   **Native `int8` Architecture**: Operates on raw bytes with a compact `N`-layer, `H`-dim topology.
-*   **Quantized Sigmoid Self-Attention**: Replaces standard floating-point attention with a novel `int32` accumulation scheme and quantized weighting, specifically designed for discrete optimization.
-*   **Auto-Norm & Entropy Monitoring**: Features custom adaptive normalization layers and specialized debugging tools to monitor entropy flow through the network during massive population assessments.
-*   **Information-Regulated Optimizer**: Implements a hybrid **ES-AdamW** approach where the optimizer regulates the amount of information (bits) integrated into the integer weights, ensuring stable learning.
+*   **Quantized Sigmoid Self-Attention**: An `int32/int64` accumulation scheme and quantized weighting.
+*   **Auto-Norm & Entropy Monitoring**: Adaptive normalization layers.
+*   **EGG DEBUG**: debug-printing "tool" to monitor entropy flow through the network and weights distribution and saturation.
+*   **Information-Regulated Optimizer**: A hybrid **ES-AdamW** approach where the optimizer (`float32`) regulates the amount of updates applied to the integer weights, ensuring stable learning.
 *   **Performance**: Achieves **~300k tokens/second** with a population of 40,000+ (8192×5) on a single 4090 GPU setup, reaching loss rates (~1.45 bits/byte).
 
 <a id="multi-gpu-strategy"></a>
+
 #### Multi-GPU Strategy
 The system employs a **Synchronous Replicated Model** with **Sharded Evaluation**:
 *   **Sharded Evaluation**: The population is split across GPUs, with each evaluating a subset of perturbations in parallel.
