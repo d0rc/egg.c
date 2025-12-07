@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <vector>
 
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
@@ -32,7 +33,7 @@ void handle_sigint(int sig) {
 // --- CONFIGURATION ---
 #define HIDDEN_DIM 256
 #define HEAD_DIM 64
-#define N_LAYERS 12
+#define N_LAYERS 4
 #define SEQ_LEN 128     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
@@ -41,12 +42,12 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 3)
-#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 1)
+#define POPULATION_BATCH_SIZE (8192 * 11)
+#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
 
 #define FIXED_POINT 4
-#define SIGMA_SHIFT 3
-#define SIGMA_SHIFT_VECTOR 2
+#define SIGMA_SHIFT 4
+#define SIGMA_SHIFT_VECTOR 3
 #define MAX_VAL 127
 #define MIN_VAL -127
 
@@ -63,8 +64,13 @@ void handle_sigint(int sig) {
 
 #define SEED_OFF_EMB 0
 // SEED_OFF_POS removed (RoPE)
-#define SEED_OFF_EMB_BIAS 50
-#define SEED_OFF_LN_1 100
+#define SEED_OFF_EMB_BIAS_A 50
+#define SEED_OFF_EMB_BIAS_B 51
+#define SEED_OFF_LN_1_A 100
+#define SEED_OFF_LN_1_B 101
+#define SEED_OFF_LN_1_BIAS_A 110
+#define SEED_OFF_LN_1_BIAS_B 111
+
 #define SEED_OFF_Q_A 200
 #define SEED_OFF_Q_B 201
 #define SEED_OFF_K_A 202
@@ -73,27 +79,41 @@ void handle_sigint(int sig) {
 #define SEED_OFF_V_B 205
 #define SEED_OFF_O_A 206
 #define SEED_OFF_O_B 207
-#define SEED_OFF_LN_2 300
+
+#define SEED_OFF_LN_2_A 300
+#define SEED_OFF_LN_2_B 301
+#define SEED_OFF_LN_2_BIAS_A 310
+#define SEED_OFF_LN_2_BIAS_B 311
+
 #define SEED_OFF_MLP_UP_A 400
 #define SEED_OFF_MLP_UP_B 401
 #define SEED_OFF_MLP_DOWN_A 402
 #define SEED_OFF_MLP_DOWN_B 403
-#define SEED_OFF_MLP_BIAS_UP 410
-#define SEED_OFF_MLP_BIAS_DOWN 411
-#define SEED_OFF_LN_F 900
-#define SEED_OFF_LN_1_BIAS 110
-#define SEED_OFF_LN_2_BIAS 310
-#define SEED_OFF_LN_F_BIAS 910
+#define SEED_OFF_MLP_BIAS_UP_A 410
+#define SEED_OFF_MLP_BIAS_UP_B 411
+#define SEED_OFF_MLP_BIAS_DOWN_A 412
+#define SEED_OFF_MLP_BIAS_DOWN_B 413
+
+#define SEED_OFF_LN_F_A 900
+#define SEED_OFF_LN_F_B 901
+#define SEED_OFF_LN_F_BIAS_A 910
+#define SEED_OFF_LN_F_BIAS_B 911
+
 #define SEED_OFF_HEAD 999
 
-#define SEED_OFF_LN_INIT 500
-#define SEED_OFF_LN_INIT_BIAS 501
-#define SEED_OFF_EMB_MLP_UP_A 502
-#define SEED_OFF_EMB_MLP_UP_B 503
-#define SEED_OFF_EMB_MLP_DOWN_A 504
-#define SEED_OFF_EMB_MLP_DOWN_B 505
-#define SEED_OFF_EMB_MLP_BIAS_UP 506
-#define SEED_OFF_EMB_MLP_BIAS_DOWN 507
+#define SEED_OFF_LN_INIT_A 500
+#define SEED_OFF_LN_INIT_B 501
+#define SEED_OFF_LN_INIT_BIAS_A 502
+#define SEED_OFF_LN_INIT_BIAS_B 503
+
+#define SEED_OFF_EMB_MLP_UP_A 510
+#define SEED_OFF_EMB_MLP_UP_B 511
+#define SEED_OFF_EMB_MLP_DOWN_A 512
+#define SEED_OFF_EMB_MLP_DOWN_B 513
+#define SEED_OFF_EMB_MLP_BIAS_UP_A 514
+#define SEED_OFF_EMB_MLP_BIAS_UP_B 515
+#define SEED_OFF_EMB_MLP_BIAS_DOWN_A 516
+#define SEED_OFF_EMB_MLP_BIAS_DOWN_B 517
 
 #define SHIFT_ATTN 8
 #define SHIFT_QKV 6
@@ -104,10 +124,19 @@ void handle_sigint(int sig) {
 
 // ADAM HYPERPARAMS
 float get_learning_rate(long step) {
-    if (step > 200) {
-        return 0.01f;
+    if (step < 100) {
+        return 1.0f;
     }
-    return 0.01f;
+    if (step < 200) {
+        return 0.5f;
+    }
+    if (step < 300) {
+        return 0.25f;
+    }
+    if (step < 400) {
+        return 0.1f;
+    }
+    return 0.05f;
 }
 
 #define ADAM_BETA1 0.9f
@@ -249,7 +278,13 @@ void init_tables() {
 static inline uint32_t xorshift32_host(uint32_t *state) {
     uint32_t x = *state; x ^= x << 13; x ^= x >> 17; x ^= x << 5; *state = x; return x;
 }
-static inline int8_t gen_noise_host(uint32_t *rng) { return (int8_t)((xorshift32_host(rng) & 1 ? 1 : -1) * ((xorshift32_host(rng) >> 1) & 15)); }
+static inline int8_t gen_noise_host(uint32_t *rng) { 
+    uint32_t r = xorshift32_host(rng);
+    int8_t n1 = (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 15));
+    int8_t n2 = (int8_t)((r & 32 ? 1 : -1) * ((r >> 6) & 15));
+    int8_t n3 = (int8_t)((r & 1024 ? 1 : -1) * ((r >> 11) & 15));
+    return n1 + n2 + n3;
+}
 
 void repack_matrix(int8_t *dst, int8_t *src, int rows, int cols) {  
     int32_t *d32 = (int32_t*)dst;
@@ -325,7 +360,11 @@ __device__ __forceinline__ uint32_t hash_rng(uint32_t s, uint32_t idx) {
     uint32_t x = s + idx * 0x9e3779b9u; x ^= x >> 16; x *= 0x85ebca6b; x ^= x >> 13; x *= 0xc2b2ae35; x ^= x >> 16; return x;
 }
 __device__ __forceinline__ int8_t noise_from_hash(uint32_t s, uint32_t idx) {
-    uint32_t r = hash_rng(s, idx); return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 15));
+    uint32_t r = hash_rng(s, idx); 
+    int8_t n1 = (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 15));
+    int8_t n2 = (int8_t)((r & 32 ? 1 : -1) * ((r >> 6) & 15));
+    int8_t n3 = (int8_t)((r & 1024 ? 1 : -1) * ((r >> 11) & 15));
+    return n1 + n2 + n3;
 }
 __device__ __forceinline__ int8_t clip(AccumType a) { return (a > MAX_VAL) ? MAX_VAL : ((a < MIN_VAL) ? MIN_VAL : (int8_t)a); }
 
@@ -440,8 +479,8 @@ __device__ __forceinline__ ActType apply_standard_norm(
     WeightType w, 
     WeightType b,
     uint32_t seed_base, 
-    int off_w, 
-    int off_b, 
+    int off_w_a, int off_w_b,
+    int off_b_a, int off_b_b,
     int ns
 ) {
     AccumType x = (AccumType)val;
@@ -453,32 +492,44 @@ __device__ __forceinline__ ActType apply_standard_norm(
     AccumType b_mod = b;
 
     if (ns != 0) {
-        int8_t wn = noise_from_hash(seed_base + off_w, tid);
-        w_mod += ((AccumType)wn * ns) >> SIGMA_SHIFT_VECTOR;
+        // Universal Rank-1 Noise: Product of two independent samples
+        int8_t wn1 = noise_from_hash(seed_base + off_w_a, tid);
+        int8_t wn2 = noise_from_hash(seed_base + off_w_b, tid);
+        w_mod += ((AccumType)wn1 * wn2 * ns) >> SIGMA_SHIFT_VECTOR;
         
-        int8_t bn = noise_from_hash(seed_base + off_b, tid);
-        b_mod += ((AccumType)bn * ns) >> SIGMA_SHIFT_VECTOR;
+        int8_t bn1 = noise_from_hash(seed_base + off_b_a, tid);
+        int8_t bn2 = noise_from_hash(seed_base + off_b_b, tid);
+        b_mod += ((AccumType)bn1 * bn2 * ns) >> SIGMA_SHIFT_VECTOR;
     }
 
     return clip( (x * w_mod) / mn + b_mod );
 }
 
 struct MlpConfig {
-    int off_ln, off_ln_b;
-    int off_up_a, off_up_b, off_bias_up;
-    int off_dn_a, off_dn_b, off_bias_dn;
+    int off_ln_a, off_ln_b; 
+    int off_ln_bias_a, off_ln_bias_b;
+    int off_up_a, off_up_b;
+    int off_bias_up_a, off_bias_up_b;
+    int off_dn_a, off_dn_b;
+    int off_bias_dn_a, off_bias_dn_b;
     const char *n1, *n2, *n3;
 };
 __device__ const MlpConfig CFG_MLP_INIT = {
-    SEED_OFF_LN_INIT, SEED_OFF_LN_INIT_BIAS,
-    SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, SEED_OFF_EMB_MLP_BIAS_UP,
-    SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, SEED_OFF_EMB_MLP_BIAS_DOWN,
+    SEED_OFF_LN_INIT_A, SEED_OFF_LN_INIT_B, 
+    SEED_OFF_LN_INIT_BIAS_A, SEED_OFF_LN_INIT_BIAS_B,
+    SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 
+    SEED_OFF_EMB_MLP_BIAS_UP_A, SEED_OFF_EMB_MLP_BIAS_UP_B,
+    SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 
+    SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B,
     "LN_Init", "InitMLP_Exp", "InitMLP"
 };
 __device__ const MlpConfig CFG_MLP_LAYER = {
-    SEED_OFF_LN_2, SEED_OFF_LN_2_BIAS,
-    SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, SEED_OFF_MLP_BIAS_UP,
-    SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, SEED_OFF_MLP_BIAS_DOWN,
+    SEED_OFF_LN_2_A, SEED_OFF_LN_2_B,
+    SEED_OFF_LN_2_BIAS_A, SEED_OFF_LN_2_BIAS_B,
+    SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, 
+    SEED_OFF_MLP_BIAS_UP_A, SEED_OFF_MLP_BIAS_UP_B,
+    SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, 
+    SEED_OFF_MLP_BIAS_DOWN_A, SEED_OFF_MLP_BIAS_DOWN_B,
     "LN2", "MLP_Exp", "MLP"
 };
 
@@ -495,7 +546,7 @@ __device__ void compute_mlp(
     const MlpConfig &cfg
 ) {
     ActType *s_norm = &s_mem[HIDDEN_DIM];
-    s_norm[tid] = apply_standard_norm(s_x[tid], tid, temp_storage, shared_scalar, ln_w[tid], ln_b[tid], seed_base, cfg.off_ln, cfg.off_ln_b, ns);
+    s_norm[tid] = apply_standard_norm(s_x[tid], tid, temp_storage, shared_scalar, ln_w[tid], ln_b[tid], seed_base, cfg.off_ln_a, cfg.off_ln_b, cfg.off_ln_bias_a, cfg.off_ln_bias_b, ns);
     __syncthreads();
     if(step != -1) EGG_TRACE_STAT(step, t, l, cfg.n1, s_norm, HIDDEN_DIM);
 
@@ -505,8 +556,13 @@ __device__ void compute_mlp(
         int oidx = tid + sub*HIDDEN_DIM;
         AccumType a = compute_linear_projection((int32_t*)s_norm, (const int32_t*)up_w, HIDDEN_DIM/4, 4*HIDDEN_DIM, oidx, sb, seed_base + cfg.off_up_a, ns);
         WeightType b = up_b[oidx];
-        int8_t nb = noise_from_hash(seed_base + cfg.off_bias_up, oidx);
-        s_mlp[oidx] = d_ACT_LUT[(uint8_t)clip((a>>SHIFT_MLP_UP) + b + (((AccumType)nb * ns) >> SIGMA_SHIFT_VECTOR))];
+        
+        // Universal Rank-1 Noise for bias
+        int8_t nb1 = noise_from_hash(seed_base + cfg.off_bias_up_a, oidx);
+        int8_t nb2 = noise_from_hash(seed_base + cfg.off_bias_up_b, oidx);
+        AccumType noise_val = ((AccumType)nb1 * nb2 * ns) >> SIGMA_SHIFT_VECTOR;
+        
+        s_mlp[oidx] = d_ACT_LUT[(uint8_t)clip((a>>SHIFT_MLP_UP) + b + noise_val)];
     }
     __syncthreads();
     if(step != -1) EGG_TRACE_STAT(step, t, l, cfg.n2, s_mlp, 4*HIDDEN_DIM);
@@ -517,10 +573,15 @@ __device__ void compute_mlp(
 
     AccumType adn = compute_linear_projection((int32_t*)s_mlp, (const int32_t*)dn_w, HIDDEN_DIM, HIDDEN_DIM, tid, sb, seed_base + cfg.off_dn_a, ns);
     WeightType bdn = dn_b[tid];
-    int8_t nbdn = noise_from_hash(seed_base + cfg.off_bias_dn, tid);
+    
+    // Universal Rank-1 Noise for bias
+    int8_t nbdn1 = noise_from_hash(seed_base + cfg.off_bias_dn_a, tid);
+    int8_t nbdn2 = noise_from_hash(seed_base + cfg.off_bias_dn_b, tid);
+    AccumType noise_val = ((AccumType)nbdn1 * nbdn2 * ns) >> SIGMA_SHIFT_VECTOR;
+
     int32_t *w_max = (int32_t*)&s_mem[2*HIDDEN_DIM];
     
-    s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>( (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + bdn + (((AccumType)nbdn * ns) >> SIGMA_SHIFT_VECTOR), tid, w_max); 
+    s_x[tid] = adaptive_layer_normalize<BLOCK_THREADS/32>( (AccumType)s_x[tid] + (adn >> SHIFT_MLP_DOWN) + bdn + noise_val, tid, w_max); 
     __syncthreads();
     if(step != -1) EGG_TRACE_STAT(step, t, l, cfg.n3, s_x, HIDDEN_DIM);
 }
@@ -534,7 +595,7 @@ __device__ void compute_attention(
     uint32_t seed_base, int ns, long step, int global_pop_offset
 ) {
     ActType *s_norm = &s_mem[HIDDEN_DIM];
-    s_norm[tid] = apply_standard_norm(s_x[tid], tid, temp_storage, shared_scalar, model->ln_1[l][tid], model->ln_1_bias[l][tid], seed_base, SEED_OFF_LN_1, SEED_OFF_LN_1_BIAS, ns);
+    s_norm[tid] = apply_standard_norm(s_x[tid], tid, temp_storage, shared_scalar, model->ln_1[l][tid], model->ln_1_bias[l][tid], seed_base, SEED_OFF_LN_1_A, SEED_OFF_LN_1_B, SEED_OFF_LN_1_BIAS_A, SEED_OFF_LN_1_BIAS_B, ns);
     __syncthreads();
     if(step != -1) EGG_TRACE_STAT(step, t, l, "LN1", s_norm, HIDDEN_DIM);
 
@@ -650,14 +711,17 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         uint32_t seed_emb = (step_seed + pair_idx) + SEED_OFF_EMB;
         WeightType emb = get_embedding_byte(model->embedding, tid, input_token);
         WeightType ebias = model->emb_bias[tid];
-        int8_t emb_bias_n = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_BIAS, tid);
+        
+        int8_t emb_bias_n1 = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_BIAS_A, tid);
+        int8_t emb_bias_n2 = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_BIAS_B, tid);
+        AccumType emb_bias_chk = ((AccumType)emb_bias_n1 * emb_bias_n2 * ns) >> SIGMA_SHIFT_VECTOR;
         
         // RoPE: Absolute pos emb removed
         int8_t a_tok = noise_from_hash(seed_emb, input_token);
         int8_t b_dim = noise_from_hash(seed_emb + HIDDEN_DIM, tid);
         AccumType perturb = ((AccumType)a_tok * b_dim * ns) >> (FIXED_POINT + SIGMA_SHIFT);
 
-        s_x[tid] = clip((AccumType)emb + ebias + (((AccumType)emb_bias_n * ns) >> SIGMA_SHIFT_VECTOR) + perturb);
+        s_x[tid] = clip((AccumType)emb + ebias + emb_bias_chk + perturb);
         __syncthreads();
         EGG_TRACE_STAT(step, t, -1, "Emb", s_x, HIDDEN_DIM);
 
@@ -685,7 +749,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         ActType nf = apply_standard_norm(
             s_x[tid], tid, temp_storage, shared_scalar,
             model->ln_f[tid], model->ln_f_bias[tid],
-            step_seed + pair_idx, SEED_OFF_LN_F, SEED_OFF_LN_F_BIAS, ns
+            step_seed + pair_idx, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, ns
         );
         
         // Reuse s_mem[HD] for normed
@@ -840,7 +904,7 @@ __global__ void update_vector_adam_kernel(
     WeightType *V, 
     AdamParam *adam_state,
     int len, 
-    int off_A, 
+    int off_A, int off_B,
     int seed_base, 
     const int32_t *fitnesses, 
     uint32_t step_seed,
@@ -857,7 +921,10 @@ __global__ void update_vector_adam_kernel(
         VoteType vote = 0;
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
-            vote += (VoteType)fit * noise_from_hash(step_seed + p + seed_base + off_A, idx);
+            // Universal Rank-1 Noise: Gradient is fit * (N1 * N2)
+            VoteType n1 = (VoteType)noise_from_hash(step_seed + p + seed_base + off_A, idx);
+            VoteType n2 = (VoteType)noise_from_hash(step_seed + p + seed_base + off_B, idx);
+            vote += (VoteType)fit * n1 * n2;
         }
         
         WeightType v_val = V[idx];
@@ -926,7 +993,7 @@ __global__ void generate_sequence_kernel(
         ActType nf = apply_standard_norm(
             s_x[tid], tid, temp_storage, shared_scalar,
             model->ln_f[tid], model->ln_f_bias[tid],
-            0, 0, 0, 0
+            0, 0, 0, 0, 0, 0
         );
         ActType *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
@@ -976,14 +1043,35 @@ __global__ void generate_sequence_kernel(
 
 #include "egg_disk_utils.h"
 
+struct GPUContext {
+    int id;
+    cudaStream_t stream;
+    TransformerModel *d_model;
+    AdamModel *d_adam_state;
+    uint8_t *d_dataset;
+    int32_t *d_loss;
+    int32_t *d_fit;
+    ActType *d_kv_cache;
+    unsigned long long *d_updates_ptr;
+};
+
+void compute_fitness_host(const int32_t *losses, int32_t *fitnesses, int count) {
+    for(int i=0; i<count; i++) {
+        int32_t p = losses[2*i];
+        int32_t n = losses[2*i+1];
+        fitnesses[i] = (p < n) ? 1 : ((n < p) ? -1 : 0);
+    }
+}
+
 int main() {
     signal(SIGINT, handle_sigint);
-    init_tables();
-    cudaMemcpyToSymbol(d_EXP_LUT, h_EXP_LUT, SOFTMAX_LUT_SIZE*sizeof(int32_t));
-    cudaMemcpyToSymbol(d_ACT_LUT, h_ACT_LUT, 256*sizeof(int8_t));
-    cudaMemcpyToSymbol(d_ROPE_LUT, h_ROPE_LUT, ROPE_LUT_SIZE*sizeof(int32_t));
+    
+    int num_devices = 0;
+    cudaGetDeviceCount(&num_devices);
+    if (num_devices == 0) { printf("No CUDA devices found!\n"); exit(1); }
+    printf("Detected %d CUDA devices.\n", num_devices);
 
-    printf("\n=== EGG TRANSFORMER ADAM ===\n");
+    printf("\n=== EGG TRANSFORMER ADAM MGPU ===\n");
     printf("AdamW Config: B1=%.3f B2=%.3f EPS=%.1e WD=%.4f (Dynamic LR)\n", 
            ADAM_BETA1, ADAM_BETA2, ADAM_EPS, ADAM_WEIGHT_DECAY);
 
@@ -999,11 +1087,9 @@ int main() {
     ensure_models_dir();
     save_model_info();
     
+    // Initialize host model
     if (load_model("models/egg_transformer_last.model.bin", h_model)) {
         printf("Resumed from models/egg_transformer_last.model.bin\n");
-        // Weights are already in Packed SIMD layout.
-
-        // Try load adam
         FILE *fa = fopen("models/egg_transformer_last.adam.bin", "rb");
         if(fa) {
             printf("Loading Adam state...\n");
@@ -1018,131 +1104,193 @@ int main() {
         init_model(h_model);
     }
     
-    TransformerModel *d_model; CHECK_CUDA(cudaMalloc(&d_model, sizeof(TransformerModel)));
-    CHECK_CUDA(cudaMemcpy(d_model, h_model, sizeof(TransformerModel), cudaMemcpyHostToDevice));
-
-    // Allocate Adam State
-    AdamModel *d_adam_state; 
-    CHECK_CUDA(cudaMalloc(&d_adam_state, sizeof(AdamModel)));
-    CHECK_CUDA(cudaMemcpy(d_adam_state, h_adam_state, sizeof(AdamModel), cudaMemcpyHostToDevice));
-    // Note: if fresh start, h_adam_state is 0-calloc'd, so this is equiv to Memset 0
-
-    uint8_t *d_dataset; CHECK_CUDA(cudaMalloc(&d_dataset, ds.length));
-    CHECK_CUDA(cudaMemcpy(d_dataset, ds.data, ds.length, cudaMemcpyHostToDevice));
-
-    int32_t *d_loss, *d_fit;
-    CHECK_CUDA(cudaMalloc(&d_loss, POPULATION_SIZE * sizeof(int32_t)));
-    CHECK_CUDA(cudaMalloc(&d_fit, (POPULATION_SIZE/2) * sizeof(int32_t)));
-    
+    std::vector<GPUContext> gpus;
     size_t kv_size = (size_t)POPULATION_BATCH_SIZE * N_LAYERS * 2 * SEQ_LEN * HIDDEN_DIM;
-    printf("Allocating KV Cache: %.2f GB\n", kv_size / (1024.0*1024*1024));
-    CHECK_CUDA(cudaMalloc(&d_kv_cache, kv_size));
+    printf("Allocating KV Cache per GPU: %.2f GB\n", kv_size / (1024.0*1024*1024));
 
-    unsigned long long *d_updates_ptr;
-    CHECK_CUDA(cudaGetSymbolAddress((void**)&d_updates_ptr, d_total_updates));
+    for(int i=0; i<num_devices; i++) {
+        CHECK_CUDA(cudaSetDevice(i));
+        
+        // Init tables per device
+        init_tables();
+        cudaMemcpyToSymbol(d_EXP_LUT, h_EXP_LUT, SOFTMAX_LUT_SIZE*sizeof(int32_t));
+        cudaMemcpyToSymbol(d_ACT_LUT, h_ACT_LUT, 256*sizeof(int8_t));
+        cudaMemcpyToSymbol(d_ROPE_LUT, h_ROPE_LUT, ROPE_LUT_SIZE*sizeof(int32_t));
+        
+        GPUContext ctx;
+        ctx.id = i;
+        CHECK_CUDA(cudaStreamCreate(&ctx.stream));
+        CHECK_CUDA(cudaMalloc(&ctx.d_model, sizeof(TransformerModel)));
+        CHECK_CUDA(cudaMemcpy(ctx.d_model, h_model, sizeof(TransformerModel), cudaMemcpyHostToDevice));
+        
+        CHECK_CUDA(cudaMalloc(&ctx.d_adam_state, sizeof(AdamModel)));
+        CHECK_CUDA(cudaMemcpy(ctx.d_adam_state, h_adam_state, sizeof(AdamModel), cudaMemcpyHostToDevice));
+        
+        CHECK_CUDA(cudaMalloc(&ctx.d_dataset, ds.length));
+        CHECK_CUDA(cudaMemcpy(ctx.d_dataset, ds.data, ds.length, cudaMemcpyHostToDevice));
+        
+        CHECK_CUDA(cudaMalloc(&ctx.d_loss, POPULATION_SIZE * sizeof(int32_t)));
+        CHECK_CUDA(cudaMalloc(&ctx.d_fit, (POPULATION_SIZE/2) * sizeof(int32_t)));
+        CHECK_CUDA(cudaMalloc(&ctx.d_kv_cache, kv_size));
+        
+        CHECK_CUDA(cudaGetSymbolAddress((void**)&ctx.d_updates_ptr, d_total_updates));
+        
+        gpus.push_back(ctx);
+    }
     
-    // Generation buffers
+    // Host buffers for aggregation (Pinned Memory)
+    int32_t *h_loss; CHECK_CUDA(cudaMallocHost(&h_loss, POPULATION_SIZE * sizeof(int32_t)));
+    int32_t *h_fit; CHECK_CUDA(cudaMallocHost(&h_fit, (POPULATION_SIZE/2) * sizeof(int32_t)));
+
+    // Generation buffers (on GPU 0)
+    CHECK_CUDA(cudaSetDevice(0));
     int gen_seed_len = 32;
     int gen_output_len = 64; 
     int total_gen_len = gen_seed_len + gen_output_len;
     uint8_t *d_gen_buf; CHECK_CUDA(cudaMalloc(&d_gen_buf, total_gen_len));
     int8_t *d_gen_kv; CHECK_CUDA(cudaMalloc(&d_gen_kv, N_LAYERS * 2 * total_gen_len * HIDDEN_DIM));
 
-    printf("Starting Training...\n");
+    printf("Starting Training on %d GPUs...\n", num_devices);
     long max_steps = (ds.length - 1) / SEQ_LEN;
 
     for(long step=0; step<max_steps && keep_running; step++) {
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x12345678);
-        
         size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM); 
-        for (int offset = 0; offset < POPULATION_SIZE; offset += POPULATION_BATCH_SIZE) {
-            train_sequence_kernel<<<POPULATION_BATCH_SIZE, BLOCK_THREADS, sm_size>>>(
-                d_dataset, ds.length, step*SEQ_LEN, d_model, d_kv_cache, d_loss, seed, offset, step
-            );
+        
+        // 1. Distributed Evaluation
+        int current_pop_offset = 0;
+        
+        // Queue parallel work
+        while(current_pop_offset < POPULATION_SIZE) {
+            for(int i=0; i<num_devices; i++) {
+                if (current_pop_offset >= POPULATION_SIZE) break;
+                
+                CHECK_CUDA(cudaSetDevice(gpus[i].id));
+                int batch = POPULATION_BATCH_SIZE;
+                if (current_pop_offset + batch > POPULATION_SIZE) batch = POPULATION_SIZE - current_pop_offset;
+                
+                train_sequence_kernel<<<batch, BLOCK_THREADS, sm_size, gpus[i].stream>>>(
+                    gpus[i].d_dataset, ds.length, step*SEQ_LEN, gpus[i].d_model, gpus[i].d_kv_cache, 
+                    gpus[i].d_loss, seed, current_pop_offset, step
+                );
+                
+                // Copy losses back to host asynchronously
+                CHECK_CUDA(cudaMemcpyAsync(
+                    h_loss + current_pop_offset, 
+                    gpus[i].d_loss + current_pop_offset, 
+                    batch * sizeof(int32_t), 
+                    cudaMemcpyDeviceToHost,
+                    gpus[i].stream
+                ));
+                
+                current_pop_offset += batch;
+            }
         }
-        CHECK_CUDA(cudaDeviceSynchronize());
         
-        compute_fitness_kernel<<< (POPULATION_SIZE/2 + 255)/256, 256 >>>(d_loss, d_fit, POPULATION_SIZE/2);
+        // Wait for all evaluation to complete
+        for(int i=0; i<num_devices; i++) {
+             CHECK_CUDA(cudaSetDevice(gpus[i].id));
+             CHECK_CUDA(cudaStreamSynchronize(gpus[i].stream));
+        }
         
-        // Reset update counter
-        CHECK_CUDA(cudaMemset(d_updates_ptr, 0, sizeof(unsigned long long)));
-
-        // Adam Updates
-#define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
-    update_matrix_adam_kernel<<< (ROWS*COLS+511)/512, 512 >>>( \
-    (WeightType*)M_PTR, (AdamParam*)ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, \
-    BASE, d_fit, seed, current_lr)
-
-#define LAUNCH_ADAM_VECTOR(V_PTR, ADAM_PTR, LEN, SEED_A, BASE, LR_SCALE) \
-    update_vector_adam_kernel<<< (LEN+255)/256, 256 >>>( \
-    (WeightType*)V_PTR, (AdamParam*)ADAM_PTR, LEN, SEED_A, \
-    BASE, d_fit, seed, current_lr * LR_SCALE)
-
+        // 2. Host Fitness Calculation
+        compute_fitness_host(h_loss, h_fit, POPULATION_SIZE/2);
+        
+        // 3. Broadcast Fitness and Run Adam on all GPUs
         float current_lr = get_learning_rate(step);
-        for(int l=0; l<N_LAYERS; l++) {
-            int s_base = l * 1000;
+        
+        // Queue Updates
+        for(int i=0; i<num_devices; i++) {
+            CHECK_CUDA(cudaSetDevice(gpus[i].id));
             
-            LAUNCH_ADAM_MATRIX(d_model->w_q[l], d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base);
-            LAUNCH_ADAM_MATRIX(d_model->w_k[l], d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base);
-            LAUNCH_ADAM_MATRIX(d_model->w_v[l], d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base);
-            LAUNCH_ADAM_MATRIX(d_model->w_o[l], d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base);
+            // Broadcast fitness
+            CHECK_CUDA(cudaMemcpyAsync(gpus[i].d_fit, h_fit, (POPULATION_SIZE/2) * sizeof(int32_t), cudaMemcpyHostToDevice, gpus[i].stream));
             
-            LAUNCH_ADAM_MATRIX(d_model->w_up[l], d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base);
-            LAUNCH_ADAM_MATRIX(d_model->w_down[l], d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base);
+            // Reset update counter
+            CHECK_CUDA(cudaMemsetAsync(gpus[i].d_updates_ptr, 0, sizeof(unsigned long long), gpus[i].stream));
+
+            // Adam Updates
+    #define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
+        update_matrix_adam_kernel<<< (ROWS*COLS+511)/512, 512, 0, gpus[i].stream >>>( \
+        (WeightType*)M_PTR, (AdamParam*)ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, \
+        BASE, gpus[i].d_fit, seed, current_lr)
+
+    #define LAUNCH_ADAM_VECTOR(V_PTR, ADAM_PTR, LEN, SEED_A, SEED_B, BASE, LR_SCALE) \
+        update_vector_adam_kernel<<< (LEN+255)/256, 256, 0, gpus[i].stream >>>( \
+        (WeightType*)V_PTR, (AdamParam*)ADAM_PTR, LEN, SEED_A, SEED_B, \
+        BASE, gpus[i].d_fit, seed, current_lr * LR_SCALE)
+
+            for(int l=0; l<N_LAYERS; l++) {
+                int s_base = l * 1000;
+                LAUNCH_ADAM_MATRIX(gpus[i].d_model->w_q[l], gpus[i].d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base);
+                LAUNCH_ADAM_MATRIX(gpus[i].d_model->w_k[l], gpus[i].d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base);
+                LAUNCH_ADAM_MATRIX(gpus[i].d_model->w_v[l], gpus[i].d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base);
+                LAUNCH_ADAM_MATRIX(gpus[i].d_model->w_o[l], gpus[i].d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base);
+                
+                LAUNCH_ADAM_MATRIX(gpus[i].d_model->w_up[l], gpus[i].d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base);
+                LAUNCH_ADAM_MATRIX(gpus[i].d_model->w_down[l], gpus[i].d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base);
+                
+                LAUNCH_ADAM_VECTOR(gpus[i].d_model->ln_1[l], gpus[i].d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1_A, SEED_OFF_LN_1_B, s_base, 1.0f);
+                LAUNCH_ADAM_VECTOR(gpus[i].d_model->ln_1_bias[l], gpus[i].d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS_A, SEED_OFF_LN_1_BIAS_B, s_base, 1.0f);
+                
+                LAUNCH_ADAM_VECTOR(gpus[i].d_model->ln_2[l], gpus[i].d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2_A, SEED_OFF_LN_2_B, s_base, 1.0f);
+                LAUNCH_ADAM_VECTOR(gpus[i].d_model->ln_2_bias[l], gpus[i].d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS_A, SEED_OFF_LN_2_BIAS_B, s_base, 1.0f);
+                
+                LAUNCH_ADAM_VECTOR(gpus[i].d_model->mlp_bias_up[l], gpus[i].d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP_A, SEED_OFF_MLP_BIAS_UP_B, s_base, 1.0f);
+                LAUNCH_ADAM_VECTOR(gpus[i].d_model->mlp_bias_down[l], gpus[i].d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN_A, SEED_OFF_MLP_BIAS_DOWN_B, s_base, 1.0f);
+            }
             
-            LAUNCH_ADAM_VECTOR(d_model->ln_1[l], d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1, s_base, 1.0f);
-            LAUNCH_ADAM_VECTOR(d_model->ln_1_bias[l], d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS, s_base, 1.0f);
+            LAUNCH_ADAM_VECTOR(gpus[i].d_model->ln_f, gpus[i].d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, 0, 1.0f);
+            LAUNCH_ADAM_VECTOR(gpus[i].d_model->ln_f_bias, gpus[i].d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, 0, 1.0f);
             
-            LAUNCH_ADAM_VECTOR(d_model->ln_2[l], d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2, s_base, 1.0f);
-            LAUNCH_ADAM_VECTOR(d_model->ln_2_bias[l], d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS, s_base, 1.0f);
+            LAUNCH_ADAM_VECTOR(gpus[i].d_model->ln_init, gpus[i].d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT_A, SEED_OFF_LN_INIT_B, 0, 1.0f);
+            LAUNCH_ADAM_VECTOR(gpus[i].d_model->ln_init_bias, gpus[i].d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS_A, SEED_OFF_LN_INIT_BIAS_B, 0, 1.0f);
+
+            LAUNCH_ADAM_MATRIX(gpus[i].d_model->w_emb_mlp_up, gpus[i].d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0);
+            LAUNCH_ADAM_VECTOR(gpus[i].d_model->mlp_emb_bias_up, gpus[i].d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP_A, SEED_OFF_EMB_MLP_BIAS_UP_B, 0, 1.0f);
+
+            LAUNCH_ADAM_MATRIX(gpus[i].d_model->w_emb_mlp_down, gpus[i].d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0);
+            LAUNCH_ADAM_VECTOR(gpus[i].d_model->mlp_emb_bias_down, gpus[i].d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B, 0, 1.0f);
+
+            LAUNCH_ADAM_VECTOR(gpus[i].d_model->emb_bias, gpus[i].d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS_A, SEED_OFF_EMB_BIAS_B, 0, 0.1f);
+            LAUNCH_ADAM_MATRIX(gpus[i].d_model->embedding, gpus[i].d_adam_state->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0);
             
-            LAUNCH_ADAM_VECTOR(d_model->mlp_bias_up[l], d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP, s_base, 1.0f);
-            LAUNCH_ADAM_VECTOR(d_model->mlp_bias_down[l], d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN, s_base, 1.0f);
+    #undef LAUNCH_ADAM_MATRIX
+    #undef LAUNCH_ADAM_VECTOR
         }
         
-        LAUNCH_ADAM_VECTOR(d_model->ln_f, d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, 1.0f);
-        LAUNCH_ADAM_VECTOR(d_model->ln_f_bias, d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS, 0, 1.0f);
-        
-        // Initial MLP Updates
-        LAUNCH_ADAM_VECTOR(d_model->ln_init, d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT, 0, 1.0f);
-        LAUNCH_ADAM_VECTOR(d_model->ln_init_bias, d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS, 0, 1.0f);
+        // Wait for Adam Updates
+        for(int i=0; i<num_devices; i++) {
+             CHECK_CUDA(cudaSetDevice(gpus[i].id));
+             CHECK_CUDA(cudaStreamSynchronize(gpus[i].stream));
+        }
 
-        LAUNCH_ADAM_MATRIX(d_model->w_emb_mlp_up, d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0);
-        LAUNCH_ADAM_VECTOR(d_model->mlp_emb_bias_up, d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP, 0, 1.0f);
-
-        LAUNCH_ADAM_MATRIX(d_model->w_emb_mlp_down, d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0);
-        LAUNCH_ADAM_VECTOR(d_model->mlp_emb_bias_down, d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN, 0, 1.0f);
-
-        LAUNCH_ADAM_VECTOR(d_model->emb_bias, d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS, 0, 0.1f); 
-        LAUNCH_ADAM_MATRIX(d_model->embedding, d_adam_state->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0);
-        
-#undef LAUNCH_ADAM_MATRIX
-#undef LAUNCH_ADAM_VECTOR
-        // RoPE: Removed pos_emb update
-
-        CHECK_CUDA(cudaDeviceSynchronize());
         clock_gettime(CLOCK_MONOTONIC, &t1);
         
+        // Updates count from GPU 0 (identically executed on all)
+        CHECK_CUDA(cudaSetDevice(gpus[0].id));
         unsigned long long h_updates = 0;
-        CHECK_CUDA(cudaMemcpy(&h_updates, d_updates_ptr, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&h_updates, gpus[0].d_updates_ptr, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         
         double step_ms = get_time_diff_ms(t0, t1);
         double tokens_per_sec = (double)(POPULATION_SIZE * SEQ_LEN) / (step_ms / 1000.0);
 
-        thrust::device_ptr<int32_t> t_loss(d_loss);
-        long long total_loss = thrust::reduce(t_loss, t_loss + POPULATION_SIZE, (long long)0);
+        long long total_loss = 0;
+        for(int k=0; k<POPULATION_SIZE; k++) total_loss += h_loss[k];
         double avg_loss = (double)total_loss / (POPULATION_SIZE * SEQ_LEN * 16.0); 
 
         printf("Step %ld | Loss: %.4f | Time: %.2f ms | Updates: %llu | Speed: %.2f tok/s | LR: %.3f\n", 
             step, avg_loss, step_ms, h_updates, tokens_per_sec, current_lr);
 
         if (step % 5 == 0) {
-            CHECK_CUDA(cudaMemcpy(d_gen_buf, d_dataset + (step*SEQ_LEN) % (ds.length-SEQ_LEN), gen_seed_len, cudaMemcpyDeviceToDevice));
-            generate_sequence_kernel<<<1, BLOCK_THREADS, sm_size>>>(
-                d_gen_buf, gen_seed_len, gen_output_len, d_model, d_gen_kv, seed+999
+            // Generation on GPU 0
+            CHECK_CUDA(cudaSetDevice(gpus[0].id));
+            CHECK_CUDA(cudaMemcpy(d_gen_buf, gpus[0].d_dataset + (step*SEQ_LEN) % (ds.length-SEQ_LEN), gen_seed_len, cudaMemcpyDeviceToDevice));
+            generate_sequence_kernel<<<1, BLOCK_THREADS, sm_size, gpus[0].stream>>>(
+                d_gen_buf, gen_seed_len, gen_output_len, gpus[0].d_model, d_gen_kv, seed+999
             );
-            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaStreamSynchronize(gpus[0].stream));
             uint8_t h_buf[256];
             CHECK_CUDA(cudaMemcpy(h_buf, d_gen_buf, total_gen_len, cudaMemcpyDeviceToHost));
             
@@ -1157,15 +1305,29 @@ int main() {
             }
             printf("\033[0m\n\n");
 
-            CHECK_CUDA(cudaMemcpy(h_model, d_model, sizeof(TransformerModel), cudaMemcpyDeviceToHost));
-            CHECK_CUDA(cudaMemcpy(h_adam_state, d_adam_state, sizeof(AdamModel), cudaMemcpyDeviceToHost));
+            // Save Model from GPU 0
+            CHECK_CUDA(cudaMemcpy(h_model, gpus[0].d_model, sizeof(TransformerModel), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(h_adam_state, gpus[0].d_adam_state, sizeof(AdamModel), cudaMemcpyDeviceToHost));
             save_checkpoint(h_model, h_adam_state, step);
         }
     }
+    
+    // Cleanup
+    cudaSetDevice(0);
     cudaFree(d_gen_buf); cudaFree(d_gen_kv);
+    cudaFreeHost(h_loss); cudaFreeHost(h_fit);
+
+    for(auto &ctx : gpus) {
+        CHECK_CUDA(cudaSetDevice(ctx.id));
+        cudaFree(ctx.d_model); 
+        cudaFree(ctx.d_dataset);
+        cudaFree(ctx.d_loss);
+        cudaFree(ctx.d_fit);
+        cudaFree(ctx.d_kv_cache);
+        cudaFree(ctx.d_adam_state);
+        cudaStreamDestroy(ctx.stream);
+    }
 
     free(h_model); free(h_adam_state); free(ds.data);
-    cudaFree(d_model); cudaFree(d_dataset); cudaFree(d_loss); cudaFree(d_fit); cudaFree(d_kv_cache);
-    cudaFree(d_adam_state);
     return 0;
 }
