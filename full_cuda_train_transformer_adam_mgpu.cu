@@ -31,34 +31,64 @@ void handle_sigint(int sig) {
     keep_running = 0;
 }
 
-// --- CONFIGURATION ---
-#define HIDDEN_DIM 256
-#define HEAD_DIM 64
-#define N_LAYERS 4
-#define SEQ_LEN 128     
-#define VOCAB_SIZE 256
-#define WARP_SIZE 32
-#define MAX_BLOCK_THREADS 1024 
+// --- CONFIGURATION (all overridable via -D flags) ---
+#ifndef HIDDEN_DIM
+#  define HIDDEN_DIM 256
+#endif
+#ifndef HEAD_DIM
+#  define HEAD_DIM 64
+#endif
+#ifndef N_LAYERS
+#  define N_LAYERS 4
+#endif
+#ifndef SEQ_LEN
+#  define SEQ_LEN 128
+#endif
+#ifndef VOCAB_SIZE
+#  define VOCAB_SIZE 256
+#endif
+#ifndef WARP_SIZE
+#  define WARP_SIZE 32
+#endif
+#ifndef MAX_BLOCK_THREADS
+#  define MAX_BLOCK_THREADS 1024
+#endif
 #define ALIGNED_DIM ((HIDDEN_DIM + 31) & ~31)
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 5 * 2)
+#ifndef POPULATION_BATCH_SIZE
+#  define POPULATION_BATCH_SIZE (8192 * 5 * 2)
+#endif
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
 
-#define FIXED_POINT 4
-#define SIGMA_SHIFT 4
-#define SIGMA_SHIFT_VECTOR 3
+#ifndef FIXED_POINT
+#  define FIXED_POINT 4
+#endif
+#ifndef SIGMA_SHIFT
+#  define SIGMA_SHIFT 4
+#endif
+#ifndef SIGMA_SHIFT_VECTOR
+#  define SIGMA_SHIFT_VECTOR 3
+#endif
 #define MAX_VAL 127
 #define MIN_VAL -127
 
-#define SOFTMAX_SCALE_BIT 18
-#define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)  
-#define SOFTMAX_LUT_SIZE 256
-#define SOFTMAX_EXP_SCALE 8.0 // was 11.54 
+#ifndef SOFTMAX_SCALE_BIT
+#  define SOFTMAX_SCALE_BIT 18
+#endif
+#define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)
+#ifndef SOFTMAX_LUT_SIZE
+#  define SOFTMAX_LUT_SIZE 256
+#endif
+#ifndef SOFTMAX_EXP_SCALE
+#  define SOFTMAX_EXP_SCALE 8.0
+#endif
 
 // RoPE Configuration
-#define ROPE_SCALE_BIT 30
+#ifndef ROPE_SCALE_BIT
+#  define ROPE_SCALE_BIT 30
+#endif
 #define ROPE_SCALE (1 << ROPE_SCALE_BIT)
 #define ROPE_LUT_SIZE (SEQ_LEN * (HEAD_DIM / 2) * 2)
 
@@ -116,18 +146,38 @@ void handle_sigint(int sig) {
 #define SEED_OFF_EMB_MLP_BIAS_DOWN_A 516
 #define SEED_OFF_EMB_MLP_BIAS_DOWN_B 517
 
-#define SHIFT_ATTN 8
-#define SHIFT_QKV 6
-#define SHIFT_OUT 9
-#define SHIFT_LOGIT 8
-#define SHIFT_MLP_UP 8
-#define SHIFT_MLP_DOWN 10
+#ifndef SHIFT_ATTN
+#  define SHIFT_ATTN 8
+#endif
+#ifndef SHIFT_QKV
+#  define SHIFT_QKV 6
+#endif
+#ifndef SHIFT_OUT
+#  define SHIFT_OUT 9
+#endif
+#ifndef SHIFT_LOGIT
+#  define SHIFT_LOGIT 8
+#endif
+#ifndef SHIFT_MLP_UP
+#  define SHIFT_MLP_UP 8
+#endif
+#ifndef SHIFT_MLP_DOWN
+#  define SHIFT_MLP_DOWN 10
+#endif
 
 // Generator settings
-#define HOST_GAUSSIAN false
-#define DEVICE_GAUSSIAN false
-#define HOST_MASK 15
-#define DEVICE_MASK 15
+#ifndef HOST_GAUSSIAN
+#  define HOST_GAUSSIAN false
+#endif
+#ifndef DEVICE_GAUSSIAN
+#  define DEVICE_GAUSSIAN false
+#endif
+#ifndef HOST_MASK
+#  define HOST_MASK 15
+#endif
+#ifndef DEVICE_MASK
+#  define DEVICE_MASK 15
+#endif
 
 // ADAM HYPERPARAMS
 float get_learning_rate(long step) {
@@ -152,16 +202,30 @@ float get_learning_rate(long step) {
     return 0.025f;
 }
 
-#define ADAM_BETA1 0.9f
-#define ADAM_BETA2 0.98f
-#define ADAM_EPS 1e-8f
-#define ADAM_WEIGHT_DECAY 0.01f
+#ifndef ADAM_BETA1
+#  define ADAM_BETA1 0.9f
+#endif
+#ifndef ADAM_BETA2
+#  define ADAM_BETA2 0.98f
+#endif
+#ifndef ADAM_EPS
+#  define ADAM_EPS 1e-8f
+#endif
+#ifndef ADAM_WEIGHT_DECAY
+#  define ADAM_WEIGHT_DECAY 0.01f
+#endif
 
-#define USE_MUON // Unwrap to enable Muon Optimizer
+#ifndef USE_MUON
+#  define USE_MUON 1
+#endif
 
-#ifdef USE_MUON
-    #define MUON_MOMENTUM 0.85f
-    #define MUON_LR_SCALE 1.0f
+#if USE_MUON
+#  ifndef MUON_MOMENTUM
+#    define MUON_MOMENTUM 0.85f
+#  endif
+#  ifndef MUON_LR_SCALE
+#    define MUON_LR_SCALE 1.0f
+#  endif
 #endif
 
 #define CHECK_CUDA(call) { cudaError_t err = call; if (err != cudaSuccess) { printf("CUDA Error: %s:%d\n", cudaGetErrorString(err), __LINE__); exit(1); } }

@@ -8,7 +8,12 @@
 #include <string.h>
 
 #define EGG_API_BASE "https://jlbhiestcyjduotrkmwl.supabase.co/functions/v1"
-#define EGG_PROJECT_ID "f14854a9-9960-4272-b299-7076cf508480"
+#define EGG_PROJECT_ID "3c4622f3-2e65-460c-bff5-c794824ee72d"
+
+// Experiment name - can be overridden via -DEXPERIMENT_NAME=\"my_experiment\"
+#ifndef EXPERIMENT_NAME
+#  define EXPERIMENT_NAME "unnamed"
+#endif
 
 // Struct to hold logger state
 typedef struct {
@@ -142,7 +147,7 @@ static inline EggLogState egg_log_init(
     // Construct simplified name and config (includes ALL EggLogConfig fields)
     char json_body[4096];
     snprintf(json_body, sizeof(json_body), 
-        "{\"project_id\": \"%s\", \"name\": \"run-%s\", \"config\": {"
+        "{\"project_id\": \"%s\", \"name\": \"%s-%s\", \"experiment\": \"%s\", \"config\": {"
         "\"gpus\": %d, \"vram_mb\": %.2f, \"hidden\": %d, \"head_dim\": %d, "
         "\"layers\": %d, \"seq_len\": %d, "
         "\"pop_size\": %d, \"vocab\": %d, \"heads\": %d, "
@@ -155,7 +160,7 @@ static inline EggLogState egg_log_init(
         "\"adam_beta1\": %.3f, \"adam_beta2\": %.3f, \"adam_eps\": %.1e, \"adam_wd\": %.4f, "
         "\"use_muon\": %d, \"muon_mom\": %.3f, \"muon_scale\": %.3f"
         "}}", 
-        EGG_PROJECT_ID, start_time_str,
+        EGG_PROJECT_ID, EXPERIMENT_NAME, start_time_str, EXPERIMENT_NAME,
         config.num_gpus, (double)config.vram_per_gpu / (1024.0 * 1024.0), 
         config.hidden_dim, config.head_dim, config.n_layers, config.seq_len,
         config.pop_size, config.vocab_size, config.n_heads,

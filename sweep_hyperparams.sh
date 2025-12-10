@@ -6,10 +6,26 @@
 
 set -e  # Exit on error
 
+# Distributed workload support
+NODE_ID=${1:-1}
+TOTAL_NODES=${2:-1}
+
+if [ $NODE_ID -lt 1 ] || [ $NODE_ID -gt $TOTAL_NODES ]; then
+    echo "Error: NODE_ID must be between 1 and TOTAL_NODES"
+    echo "Usage: $0 [NODE_ID] [TOTAL_NODES]"
+    echo "  Example: $0 1 2  # Run node 1 of 2 (experiments 0,2,4,...)"
+    echo "  Example: $0 2 2  # Run node 2 of 2 (experiments 1,3,5,...)"
+    exit 1
+fi
+
 # Configuration
 MAX_STEPS=500
 SOURCE_FILE="full_cuda_train_transformer_adam_mgpu.cu"
-OUTPUT_DIR="sweep_results_$(date +%Y%m%d_%H%M%S)"
+if [ $TOTAL_NODES -gt 1 ]; then
+    OUTPUT_DIR="sweep_results_node${NODE_ID}of${TOTAL_NODES}_$(date +%Y%m%d_%H%M%S)"
+else
+    OUTPUT_DIR="sweep_results_$(date +%Y%m%d_%H%M%S)"
+fi
 BINARY_NAME="train_sweep"
 
 # CUDA compilation flags - adjust arch for your GPU
@@ -97,7 +113,11 @@ show_progress() {
     
     echo ""
     echo "══════════════════════════════════════════════════════════════"
-    echo -e " Progress: ${GREEN}$PASSED_RUNS passed${NC} | ${RED}$FAILED_RUNS failed${NC} | ${YELLOW}$remaining remaining${NC} (${percent}% complete)"
+    if [ $TOTAL_NODES -gt 1 ]; then
+        echo -e " ${CYAN}[Node $NODE_ID/$TOTAL_NODES]${NC} ${GREEN}$PASSED_RUNS passed${NC} | ${RED}$FAILED_RUNS failed${NC} | ${YELLOW}$remaining remaining${NC} (${percent}%)"
+    else
+        echo -e " Progress: ${GREEN}$PASSED_RUNS passed${NC} | ${RED}$FAILED_RUNS failed${NC} | ${YELLOW}$remaining remaining${NC} (${percent}% complete)"
+    fi
     if [ $avg_time -gt 0 ]; then
         echo -e " Avg time/run: $(format_time $avg_time) | Elapsed: $(format_time $elapsed) | ETA: ~$(format_time $eta_seconds)"
     else
@@ -126,7 +146,7 @@ run_experiment() {
     
     # Compile with specific defines
     echo "Compiling..."
-    if ! nvcc $NVCC_BASE_FLAGS -DMAX_STEPS=$MAX_STEPS $defines \
+    if ! nvcc $NVCC_BASE_FLAGS -DMAX_STEPS=$MAX_STEPS -DEXPERIMENT_NAME=\"$name\" $defines \
          "$SOURCE_FILE" -o "$BINARY_NAME" 2>"$OUTPUT_DIR/${name}_compile.log"; then
         echo -e "${RED}[FAILED] Compilation failed for $name${NC}"
         FAILED_RUNS=$((FAILED_RUNS + 1))
@@ -166,6 +186,23 @@ run_experiment() {
     return 0
 }
 
+# Global experiment index for distributed workload
+EXPERIMENT_INDEX=0
+
+# Wrapper function for distributed execution
+run_if_assigned() {
+    local name=$1
+    shift
+    local defines="$@"
+    
+    # Check if this experiment belongs to this node
+    if [ $(( EXPERIMENT_INDEX % TOTAL_NODES )) -eq $(( NODE_ID - 1 )) ]; then
+        run_experiment "$name" $defines
+    fi
+    
+    EXPERIMENT_INDEX=$((EXPERIMENT_INDEX + 1))
+}
+
 # Function to generate summary
 generate_summary() {
     local now=$(date +%s)
@@ -197,7 +234,11 @@ generate_summary() {
     echo -e "${GREEN}Summary saved to: $summary_file${NC}"
     echo ""
     echo "╔═══════════════════════════════════════════════════════════════╗"
-    echo "║           SWEEP RESULTS SUMMARY                               ║"
+    if [ $TOTAL_NODES -gt 1 ]; then
+        echo "║       SWEEP RESULTS SUMMARY (Node $NODE_ID of $TOTAL_NODES)                  ║"
+    else
+        echo "║           SWEEP RESULTS SUMMARY                               ║"
+    fi
     echo "╠═══════════════════════════════════════════════════════════════╣"
     echo "║ Completed: $CURRENT_RUN / $TOTAL_RUNS experiments"
     echo "║ Passed: $PASSED_RUNS | Failed: $FAILED_RUNS | Success rate: ${success_rate}%"
@@ -214,8 +255,6 @@ generate_summary() {
 
 # Count total experiments first
 count_experiments() {
-    TOTAL_RUNS=0
-    
     # Baseline: 1
     # RoPE scaling: 5
     # Adam beta1: 2, Adam beta2: 2
@@ -228,9 +267,17 @@ count_experiments() {
     # Gaussian noise: 6
     # Total: 1+5+2+2+2+1+2+2+2+2+3+2+6 = 32
     
-    TOTAL_RUNS=32
+    local total=32
     
-    echo "Total experiments to run: $TOTAL_RUNS"
+    # Calculate how many experiments this node will run
+    # Formula: ceil((total - (NODE_ID - 1)) / TOTAL_NODES)
+    TOTAL_RUNS=$(( (total + TOTAL_NODES - NODE_ID) / TOTAL_NODES ))
+    
+    if [ $TOTAL_NODES -gt 1 ]; then
+        echo "Node $NODE_ID of $TOTAL_NODES: Running $TOTAL_RUNS of $total experiments"
+    else
+        echo "Total experiments to run: $TOTAL_RUNS"
+    fi
 }
 
 # Main sweep execution
@@ -243,6 +290,9 @@ main() {
     echo "========================================="
     echo "Source: $SOURCE_FILE"
     echo "Steps per run: $MAX_STEPS"
+    if [ $TOTAL_NODES -gt 1 ]; then
+        echo "Distributed: Node $NODE_ID of $TOTAL_NODES"
+    fi
     echo "Started at: $(date)"
     echo ""
     
@@ -250,88 +300,88 @@ main() {
     echo ""
     
     # ============================================
-    # BASELINE
+    # BASELINE (experiment 0)
     # ============================================
-    run_experiment "baseline" ""
+    run_if_assigned "baseline" ""
     
     # ============================================
-    # RoPE SCALING (Priority)
+    # RoPE SCALING (experiments 1-5)
     # ============================================
-    run_experiment "rope_scale_16" "-DROPE_SCALE_BIT=16"
-    run_experiment "rope_scale_18" "-DROPE_SCALE_BIT=18"
-    run_experiment "rope_scale_20" "-DROPE_SCALE_BIT=20"
-    run_experiment "rope_scale_24" "-DROPE_SCALE_BIT=24"
-    run_experiment "rope_scale_30" "-DROPE_SCALE_BIT=30"
+    run_if_assigned "rope_scale_16" "-DROPE_SCALE_BIT=16"
+    run_if_assigned "rope_scale_18" "-DROPE_SCALE_BIT=18"
+    run_if_assigned "rope_scale_20" "-DROPE_SCALE_BIT=20"
+    run_if_assigned "rope_scale_24" "-DROPE_SCALE_BIT=24"
+    run_if_assigned "rope_scale_30" "-DROPE_SCALE_BIT=30"
     
     # ============================================
-    # ADAM OPTIMIZER
+    # ADAM OPTIMIZER (experiments 6-11)
     # ============================================
     # Beta1 variations
-    run_experiment "adam_beta1_0.85" "-DADAM_BETA1=0.85f"
-    run_experiment "adam_beta1_0.95" "-DADAM_BETA1=0.95f"
+    run_if_assigned "adam_beta1_0.85" "-DADAM_BETA1=0.85f"
+    run_if_assigned "adam_beta1_0.95" "-DADAM_BETA1=0.95f"
     
     # Beta2 variations
-    run_experiment "adam_beta2_0.95" "-DADAM_BETA2=0.95f"
-    run_experiment "adam_beta2_0.99" "-DADAM_BETA2=0.99f"
+    run_if_assigned "adam_beta2_0.95" "-DADAM_BETA2=0.95f"
+    run_if_assigned "adam_beta2_0.99" "-DADAM_BETA2=0.99f"
     
     # Weight decay variations
-    run_experiment "wd_0.001" "-DADAM_WEIGHT_DECAY=0.001f"
-    run_experiment "wd_0.1" "-DADAM_WEIGHT_DECAY=0.1f"
+    run_if_assigned "wd_0.001" "-DADAM_WEIGHT_DECAY=0.001f"
+    run_if_assigned "wd_0.1" "-DADAM_WEIGHT_DECAY=0.1f"
     
     # ============================================
-    # MUON VS ADAM
+    # MUON VS ADAM (experiments 12-14)
     # ============================================
     # Test without Muon (pure Adam)
-    run_experiment "no_muon" "-UUSE_MUON"
+    run_if_assigned "no_muon" "-DUSE_MUON=0"
     
     # Muon momentum variations (only if Muon enabled by default)
-    run_experiment "muon_momentum_0.8" "-DMUON_MOMENTUM=0.8f"
-    run_experiment "muon_momentum_0.9" "-DMUON_MOMENTUM=0.9f"
+    run_if_assigned "muon_momentum_0.8" "-DMUON_MOMENTUM=0.8f"
+    run_if_assigned "muon_momentum_0.9" "-DMUON_MOMENTUM=0.9f"
     
     # ============================================
-    # NOISE PARAMETERS
+    # NOISE PARAMETERS (experiments 15-20)
     # ============================================
     # Sigma shift (controls noise magnitude in matmuls)
-    run_experiment "sigma_shift_3" "-DSIGMA_SHIFT=3"
-    run_experiment "sigma_shift_5" "-DSIGMA_SHIFT=5"
+    run_if_assigned "sigma_shift_3" "-DSIGMA_SHIFT=3"
+    run_if_assigned "sigma_shift_5" "-DSIGMA_SHIFT=5"
     
     # Sigma shift vector (controls noise in vectors)
-    run_experiment "sigma_shift_vec_2" "-DSIGMA_SHIFT_VECTOR=2"
-    run_experiment "sigma_shift_vec_4" "-DSIGMA_SHIFT_VECTOR=4"
+    run_if_assigned "sigma_shift_vec_2" "-DSIGMA_SHIFT_VECTOR=2"
+    run_if_assigned "sigma_shift_vec_4" "-DSIGMA_SHIFT_VECTOR=4"
     
     # Device mask (noise range: 2^bits - 1)
-    run_experiment "device_mask_7" "-DDEVICE_MASK=7"
-    run_experiment "device_mask_31" "-DDEVICE_MASK=31"
+    run_if_assigned "device_mask_7" "-DDEVICE_MASK=7"
+    run_if_assigned "device_mask_31" "-DDEVICE_MASK=31"
     
     # ============================================
-    # SOFTMAX / ATTENTION SCALING
+    # SOFTMAX / ATTENTION SCALING (experiments 21-25)
     # ============================================
     # Softmax exp scale (temperature)
-    run_experiment "softmax_scale_6" "-DSOFTMAX_EXP_SCALE=6.0"
-    run_experiment "softmax_scale_10" "-DSOFTMAX_EXP_SCALE=10.0"
-    run_experiment "softmax_scale_12" "-DSOFTMAX_EXP_SCALE=12.0"
+    run_if_assigned "softmax_scale_6" "-DSOFTMAX_EXP_SCALE=6.0"
+    run_if_assigned "softmax_scale_10" "-DSOFTMAX_EXP_SCALE=10.0"
+    run_if_assigned "softmax_scale_12" "-DSOFTMAX_EXP_SCALE=12.0"
     
     # Attention shift
-    run_experiment "shift_attn_6" "-DSHIFT_ATTN=6"
-    run_experiment "shift_attn_10" "-DSHIFT_ATTN=10"
+    run_if_assigned "shift_attn_6" "-DSHIFT_ATTN=6"
+    run_if_assigned "shift_attn_10" "-DSHIFT_ATTN=10"
     
     # ============================================
-    # GAUSSIAN NOISE (Experimental)
+    # GAUSSIAN NOISE (experiments 26-31)
     # Note: Gaussian sums 3 noise samples, giving ~3x larger magnitude!
     # May need sigma shift compensation for stability.
     # ============================================
     
     # Device Gaussian only (with extra sigma shift to compensate for 3x magnitude)
-    run_experiment "device_gaussian" "-DDEVICE_GAUSSIAN=true"
-    run_experiment "device_gaussian_sigma6" "-DDEVICE_GAUSSIAN=true -DSIGMA_SHIFT=6"
+    run_if_assigned "device_gaussian" "-DDEVICE_GAUSSIAN=true"
+    run_if_assigned "device_gaussian_sigma6" "-DDEVICE_GAUSSIAN=true -DSIGMA_SHIFT=6"
     
     # Host Gaussian only
-    run_experiment "host_gaussian" "-DHOST_GAUSSIAN=true"
-    run_experiment "host_gaussian_sigma6" "-DHOST_GAUSSIAN=true -DSIGMA_SHIFT=6"
+    run_if_assigned "host_gaussian" "-DHOST_GAUSSIAN=true"
+    run_if_assigned "host_gaussian_sigma6" "-DHOST_GAUSSIAN=true -DSIGMA_SHIFT=6"
     
     # Both Gaussian (likely unstable without compensation)
-    run_experiment "both_gaussian" "-DHOST_GAUSSIAN=true -DDEVICE_GAUSSIAN=true"
-    run_experiment "both_gaussian_sigma6" "-DHOST_GAUSSIAN=true -DDEVICE_GAUSSIAN=true -DSIGMA_SHIFT=6"
+    run_if_assigned "both_gaussian" "-DHOST_GAUSSIAN=true -DDEVICE_GAUSSIAN=true"
+    run_if_assigned "both_gaussian_sigma6" "-DHOST_GAUSSIAN=true -DDEVICE_GAUSSIAN=true -DSIGMA_SHIFT=6"
     
     # ============================================
     # SUMMARY
