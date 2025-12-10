@@ -139,12 +139,15 @@ static inline EggLogState egg_log_init(
     }
 
     // --- Tracking Integration (Create Run) ---
-    // Construct simplified name and config
+    // Construct simplified name and config (includes ALL EggLogConfig fields)
     char json_body[4096];
     snprintf(json_body, sizeof(json_body), 
         "{\"project_id\": \"%s\", \"name\": \"run-%s\", \"config\": {"
-        "\"gpus\": %d, \"hidden\": %d, \"layers\": %d, \"seq_len\": %d, "
+        "\"gpus\": %d, \"vram_mb\": %.2f, \"hidden\": %d, \"head_dim\": %d, "
+        "\"layers\": %d, \"seq_len\": %d, "
         "\"pop_size\": %d, \"vocab\": %d, \"heads\": %d, "
+        "\"host_gaussian\": %d, \"device_gaussian\": %d, "
+        "\"host_mask\": %d, \"device_mask\": %d, "
         "\"fixed_point\": %d, \"sigma_shift\": %d, \"sigma_shift_vec\": %d, "
         "\"shift_attn\": %d, \"shift_qkv\": %d, \"shift_out\": %d, \"shift_logit\": %d, "
         "\"shift_mlp_up\": %d, \"shift_mlp_dn\": %d, "
@@ -153,8 +156,11 @@ static inline EggLogState egg_log_init(
         "\"use_muon\": %d, \"muon_mom\": %.3f, \"muon_scale\": %.3f"
         "}}", 
         EGG_PROJECT_ID, start_time_str,
-        config.num_gpus, config.hidden_dim, config.n_layers, config.seq_len,
+        config.num_gpus, (double)config.vram_per_gpu / (1024.0 * 1024.0), 
+        config.hidden_dim, config.head_dim, config.n_layers, config.seq_len,
         config.pop_size, config.vocab_size, config.n_heads,
+        config.host_gaussian, config.device_gaussian,
+        config.host_mask, config.device_mask,
         config.fixed_point, config.sigma_shift, config.sigma_shift_vector,
         config.shift_attn, config.shift_qkv, config.shift_out, config.shift_logit,
         config.shift_mlp_up, config.shift_mlp_down,

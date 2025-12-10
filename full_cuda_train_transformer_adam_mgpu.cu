@@ -43,7 +43,7 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 5)
+#define POPULATION_BATCH_SIZE (8192 * 5 * 2)
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
 
 #define FIXED_POINT 4
@@ -295,7 +295,7 @@ void init_tables() {
             double c = cos(alpha);
             double s = sin(alpha);
             
-            // Scale by ROPE_SCALE (2^16)
+            // Scale by ROPE_SCALE (2^ROPE_SCALE_BIT, default 2^30)
             int32_t c_int = (int32_t)round(c * ROPE_SCALE);
             int32_t s_int = (int32_t)round(s * ROPE_SCALE);
             
@@ -1234,13 +1234,14 @@ int main() {
 #ifdef USE_MUON
         CHECK_CUBLAS(cublasCreate(&ctx.cublas_handle));
         CHECK_CUBLAS(cublasSetStream(ctx.cublas_handle, ctx.stream));
-        // Allocate workspace for max size (MLP: 768 * 3072)
+        // Allocate workspace for max size (MLP: HIDDEN_DIM * 4*HIDDEN_DIM)
         size_t max_mx_elems = HIDDEN_DIM * (HIDDEN_DIM * 4);
         size_t gram_elems = HIDDEN_DIM * HIDDEN_DIM;
         CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_buf1, max_mx_elems * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_buf2, gram_elems * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_buf3, gram_elems * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_buf_swap, max_mx_elems * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_scalar, sizeof(float)));
 #endif
 
         gpus.push_back(ctx);
@@ -1262,6 +1263,9 @@ int main() {
     long max_steps = (ds.length - 1) / SEQ_LEN;
 
     for(long step=0; step<max_steps && keep_running; step++) {
+#ifdef MAX_STEPS
+        if (step >= MAX_STEPS) break;
+#endif
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x12345678);
         size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM); 
@@ -1315,11 +1319,7 @@ int main() {
         
         // Queue Updates
         for(int i=0; i<num_devices; i++) {
-            printf("running step %d on GPU %d\n", step, i);
             CHECK_CUDA(cudaSetDevice(gpus[i].id));
-            
-            // Explicit Sync to catch errors before Memcpy
-            CHECK_CUDA(cudaDeviceSynchronize()); 
             
             // Broadcast fitness
             CHECK_CUDA(cudaMemcpyAsync(gpus[i].d_fit, h_fit, (POPULATION_SIZE/2) * sizeof(int32_t), cudaMemcpyHostToDevice, gpus[i].stream));
@@ -1474,6 +1474,7 @@ int main() {
         cudaFree(ctx.muon_ws.d_buf2);
         cudaFree(ctx.muon_ws.d_buf3);
         cudaFree(ctx.muon_ws.d_buf_swap);
+        cudaFree(ctx.muon_ws.d_scalar);
 #endif
         cudaStreamDestroy(ctx.stream);
     }

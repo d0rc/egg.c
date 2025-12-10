@@ -72,7 +72,19 @@ __global__ void muon_gather_m_kernel(
     }
 }
 
-// 3. Newton-Schulz Term Kernel
+// 3. Scale by Norm Kernel (Async Normalization)
+// Reads norm from device memory and scales all elements by 1/norm
+__global__ void muon_scale_by_norm_kernel(float *X, const float *norm_ptr, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float norm = *norm_ptr;
+        if (norm > 1e-6f) {
+            X[idx] /= norm;
+        }
+    }
+}
+
+// 4. Newton-Schulz Term Kernel
 // Computes B = 3I - A element-wise
 // If we compute Gram matrix G = X^T X (Size KxK), we need (3I - G).
 // K is the small dimension.
@@ -160,12 +172,11 @@ __global__ void muon_apply_update_kernel(
 // --- Muon Internals Class ---
 
 struct MuonWorkspace {
-    float *d_buf1; // Size M*N
-    float *d_buf2; // Size K*K (Gram)
-    float *d_buf3; // Size K*K (Temp)
-    float *d_buf_swap; // Size M*N (Temp for aliasing avoidance)
-    size_t allocated_size_1;
-    size_t allocated_size_2;
+    float *d_buf1;      // Size M*N (Momentum buffer)
+    float *d_buf2;      // Size K*K (Gram matrix)
+    float *d_buf3;      // Size K*K (Newton-Schulz temp)
+    float *d_buf_swap;  // Size M*N (Temp for aliasing avoidance)
+    float *d_scalar;    // 1 float for async norm result
 };
 
 void perform_newton_schulz(
@@ -198,32 +209,18 @@ void perform_newton_schulz(
     int K = use_rows ? rows : cols;
     int L = use_rows ? cols : rows;
     
-    // 1. RMS Cleaning / Scaling
-    // Norm of X.
+    // 1. Async Frobenius Norm Scaling
+    // Use device pointer mode to avoid implicit sync
+    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE);
+    cublasSnrm2(handle, rows * cols, d_X, 1, ws.d_scalar);  // Writes to device memory (async)
+    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
+    
+    // Launch kernel to scale X by 1/norm (reads d_scalar on device)
+    int n_elems = rows * cols;
+    muon_scale_by_norm_kernel<<<(n_elems + 255) / 256, 256, 0, stream>>>(d_X, ws.d_scalar, n_elems);
+
     float alpha = 1.0f;
     float beta = 0.0f;
-    float norm = 0.0f;
-    cublasSnrm2(handle, rows * cols, d_X, 1, &norm);
-    
-    // Scale X to have spectral norm ~1.
-    // Heuristic: E[Tr(XX^T)] or Frobenius norm?
-    // Standard Muon: X /= (norm_fro + epsilon) * sqrt(rows*cols)?
-    // Or just X /= norm_fro.
-    // If we use Frobenius, spectral norm <= Frobenius.
-    // We want spectral norm to be slightly < sqrt(3) for convergence.
-    // Usually scaling by Frobenius is safe but conservative.
-    // More aggressive: X *= sqrt(K) / norm ?
-    // Let's use standard: X /= norm.
-    if (norm > 1e-6f) {
-        float scale = 1.0f / norm; 
-        // We want somewhat larger scale to speed up?
-        // Let's stick to safe Frobenius normalization for now.
-        // Or scale such that RMS is 1?
-        // RMS = norm / sqrt(N).
-        // If we set RMS=1, then Frobenius = sqrt(N).
-        // Let's try to normalize so Frobenius is 1.0 first.
-        cublasSscal(handle, rows*cols, &scale, d_X, 1);
-    }
 
     // 5 Iterations
     for(int i=0; i<5; i++) {
