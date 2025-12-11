@@ -33,16 +33,23 @@ void handle_sigint(int sig) {
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 256
+#  define HIDDEN_DIM 512
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64
 #endif
 #ifndef N_LAYERS
-#  define N_LAYERS 4
+#  define N_LAYERS 8
 #endif
 #ifndef SEQ_LEN
-#  define SEQ_LEN 128
+#  define SEQ_LEN 256
+#endif
+
+#include "egg_ntt.cuh"
+
+// NTT Mode: 0=disabled, 1=Walsh-Hadamard, 2=Fermat-257, 3=Fermat-65537
+#ifndef NTT_MODE
+#  define NTT_MODE 0
 #endif
 #ifndef VOCAB_SIZE
 #  define VOCAB_SIZE 256
@@ -58,7 +65,7 @@ void handle_sigint(int sig) {
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 #ifndef POPULATION_BATCH_SIZE
-#  define POPULATION_BATCH_SIZE (8192 * 5 * 2)
+#  define POPULATION_BATCH_SIZE (8192 * 1)
 #endif
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
 
@@ -145,6 +152,11 @@ void handle_sigint(int sig) {
 #define SEED_OFF_EMB_MLP_BIAS_UP_B 515
 #define SEED_OFF_EMB_MLP_BIAS_DOWN_A 516
 #define SEED_OFF_EMB_MLP_BIAS_DOWN_B 517
+
+// NTT Embedding Seed Offsets (for int32 decomposition: bytes 1, 2, 3)
+#define SEED_OFF_NTT_EMB1 600
+#define SEED_OFF_NTT_EMB2 610
+#define SEED_OFF_NTT_EMB3 620
 
 #ifndef SHIFT_ATTN
 #  define SHIFT_ATTN 8
@@ -243,6 +255,14 @@ typedef struct { uint8_t *data; long length; } Dataset;
 typedef struct {
     WeightType embedding[VOCAB_SIZE * HIDDEN_DIM];
     WeightType emb_bias[HIDDEN_DIM];
+    
+#if NTT_MODE != 0
+    // NTT coefficient embedding tables (for int32 decomposition: bytes 1, 2, 3)
+    WeightType ntt_emb1[VOCAB_SIZE * HIDDEN_DIM];  // Byte 1 of NTT coefficient
+    WeightType ntt_emb2[VOCAB_SIZE * HIDDEN_DIM];  // Byte 2 of NTT coefficient
+    WeightType ntt_emb3[VOCAB_SIZE * HIDDEN_DIM];  // Byte 3 (sign byte) of NTT coefficient
+#endif
+    
     // RoPE: pos_emb removed
     // Initial MLP Layer
     WeightType ln_init[HIDDEN_DIM];
@@ -288,7 +308,13 @@ typedef struct {
 typedef struct {
     AdamParam embedding[VOCAB_SIZE * HIDDEN_DIM];
     AdamParam emb_bias[HIDDEN_DIM];
-    // RoPE: pos_emb removed
+    
+#if NTT_MODE != 0
+    // NTT coefficient embedding optimizer states
+    AdamParam ntt_emb1[VOCAB_SIZE * HIDDEN_DIM];
+    AdamParam ntt_emb2[VOCAB_SIZE * HIDDEN_DIM];
+    AdamParam ntt_emb3[VOCAB_SIZE * HIDDEN_DIM];
+#endif
     
     // Initial MLP Layer
     AdamParam ln_init[HIDDEN_DIM];
@@ -325,7 +351,7 @@ __constant__ int8_t d_ACT_LUT[256];
 int8_t h_ACT_LUT[256];
 
 // RoPE Look-Up Table: [SEQ_LEN][HEAD_DIM/2][2 (cos, sin)]
-__constant__ int32_t d_ROPE_LUT[ROPE_LUT_SIZE];
+__device__ int32_t d_ROPE_LUT[ROPE_LUT_SIZE];
 int32_t h_ROPE_LUT[ROPE_LUT_SIZE];
 
 __device__ int32_t d_debug_updates[2];
@@ -413,6 +439,18 @@ void init_model(TransformerModel *model) {
     repack_matrix(model->embedding, (int8_t*)temp->embedding, HIDDEN_DIM, VOCAB_SIZE);
     
     for(int i=0; i<HIDDEN_DIM; i++) model->emb_bias[i] = 0;
+    
+#if NTT_MODE != 0
+    // Initialize NTT embedding tables
+    for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) temp->embedding[i] = gen_noise_host(&rng);
+    repack_matrix(model->ntt_emb1, (int8_t*)temp->embedding, HIDDEN_DIM, VOCAB_SIZE);
+    
+    for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) temp->embedding[i] = gen_noise_host(&rng);
+    repack_matrix(model->ntt_emb2, (int8_t*)temp->embedding, HIDDEN_DIM, VOCAB_SIZE);
+    
+    for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) temp->embedding[i] = gen_noise_host(&rng);
+    repack_matrix(model->ntt_emb3, (int8_t*)temp->embedding, HIDDEN_DIM, VOCAB_SIZE);
+#endif
     
     // Init Initial MLP
     for(int i=0; i<HIDDEN_DIM; i++) { model->ln_init[i]=16; model->ln_init_bias[i]=0; }
@@ -803,6 +841,18 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
     long long my_loss = 0; // Loss accumulation needs high precision
 
+#if NTT_MODE != 0
+    // Pre-compute NTT transform of sequence (once at start)
+    // Use end of s_mem for NTT buffer: after 2*HIDDEN_DIM + 512 + 4*HIDDEN_DIM
+    int32_t *s_ntt = (int32_t*)&s_mem[2*HIDDEN_DIM + 512 + 4*HIDDEN_DIM];
+    if (tid < SEQ_LEN) {
+        s_ntt[tid] = (int32_t)dataset[stream_pos + tid];
+    }
+    __syncthreads();
+    ntt_transform_sequence(s_ntt, SEQ_LEN, tid);
+    __syncthreads();
+#endif
+
     for (int t = 0; t < SEQ_LEN; t++) {
         
         if (step%5 == 0 && global_pop_offset == 0 && blockIdx.x == 0 && tid == 0 && t == 0) {
@@ -826,7 +876,21 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         int8_t b_dim = noise_from_hash(seed_emb + HIDDEN_DIM, tid);
         AccumType perturb = ((AccumType)a_tok * b_dim * ns) >> (FIXED_POINT + SIGMA_SHIFT);
 
+#if NTT_MODE != 0
+        // NTT coefficient embedding: decompose int32 NTT coeff into 4 bytes
+        int32_t ntt_coeff = s_ntt[t];
+        uint8_t nb1 = (uint8_t)((ntt_coeff >> 8) & 0xFF);
+        uint8_t nb2 = (uint8_t)((ntt_coeff >> 16) & 0xFF);
+        uint8_t nb3 = (uint8_t)((ntt_coeff >> 24) & 0xFF);
+        
+        WeightType ne1 = get_embedding_byte(model->ntt_emb1, tid, nb1);
+        WeightType ne2 = get_embedding_byte(model->ntt_emb2, tid, nb2);
+        WeightType ne3 = get_embedding_byte(model->ntt_emb3, tid, nb3);
+        
+        s_x[tid] = clip((AccumType)emb + ebias + emb_bias_chk + perturb + (ne1 >> 2) + (ne2 >> 2) + (ne3 >> 2));
+#else
         s_x[tid] = clip((AccumType)emb + ebias + emb_bias_chk + perturb);
+#endif
         __syncthreads();
         EGG_TRACE_STAT(step, t, -1, "Emb", s_x, HIDDEN_DIM);
 
@@ -1332,7 +1396,12 @@ int main() {
 #endif
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x12345678);
+#if NTT_MODE != 0
+        // Add SEQ_LEN*sizeof(int32_t) for NTT buffer
+        size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM) + (SEQ_LEN * sizeof(int32_t)); 
+#else
         size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM); 
+#endif
         
         // 1. Distributed Evaluation
         int current_pop_offset = 0;
@@ -1459,6 +1528,31 @@ int main() {
                 SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 
                 0, gpus[i].d_fit, seed, current_lr
             );
+
+#if NTT_MODE != 0
+            // NTT embedding optimizer updates (use Adam, not Muon)
+            update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512, 0, gpus[i].stream >>>(
+                (WeightType*)gpus[i].d_model->ntt_emb1, 
+                (AdamParam*)gpus[i].d_adam_state->ntt_emb1, 
+                HIDDEN_DIM, VOCAB_SIZE, 
+                SEED_OFF_NTT_EMB1, SEED_OFF_NTT_EMB1+HIDDEN_DIM, 
+                0, gpus[i].d_fit, seed, current_lr * 0.5f
+            );
+            update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512, 0, gpus[i].stream >>>(
+                (WeightType*)gpus[i].d_model->ntt_emb2, 
+                (AdamParam*)gpus[i].d_adam_state->ntt_emb2, 
+                HIDDEN_DIM, VOCAB_SIZE, 
+                SEED_OFF_NTT_EMB2, SEED_OFF_NTT_EMB2+HIDDEN_DIM, 
+                0, gpus[i].d_fit, seed, current_lr * 0.5f
+            );
+            update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512, 0, gpus[i].stream >>>(
+                (WeightType*)gpus[i].d_model->ntt_emb3, 
+                (AdamParam*)gpus[i].d_adam_state->ntt_emb3, 
+                HIDDEN_DIM, VOCAB_SIZE, 
+                SEED_OFF_NTT_EMB3, SEED_OFF_NTT_EMB3+HIDDEN_DIM, 
+                0, gpus[i].d_fit, seed, current_lr * 0.5f
+            );
+#endif
             
     #undef LAUNCH_ADAM_MATRIX
     #undef LAUNCH_ADAM_VECTOR
