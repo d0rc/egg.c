@@ -3,16 +3,16 @@
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 512
+#  define HIDDEN_DIM 256
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64
 #endif
 #ifndef N_LAYERS
-#  define N_LAYERS 18
+#  define N_LAYERS 12
 #endif
 #ifndef SEQ_LEN
-#  define SEQ_LEN 32
+#  define SEQ_LEN 64
 #endif
 
 // NTT Mode: 0=disabled, 1=Walsh-Hadamard, 2=Fermat-257, 3=Fermat-65537
@@ -186,6 +186,17 @@
 
 #ifndef USE_MUON
 #  define USE_MUON 0
+#endif
+
+// Sampling Configuration
+#ifndef SAMPLING_TEMP
+#  define SAMPLING_TEMP 1.0f
+#endif
+#ifndef SAMPLING_MIN_P
+#  define SAMPLING_MIN_P 0.05f
+#endif
+#ifndef SAMPLING_PRESENCE_PENALTY
+#  define SAMPLING_PRESENCE_PENALTY 0.2f
 #endif
 
 #if USE_MUON

@@ -254,7 +254,8 @@ __global__ void generate_sequence_kernel(
     TokenType * buffer, int seed_len, int gen_len,
     const TransformerModel * __restrict__ model,
     ActType * __restrict__ kv_cache,
-    uint32_t seed
+    uint32_t seed,
+    float temp, float min_p, float penalty
 ) {
     if (blockIdx.x > 0) return;
     int tid = threadIdx.x;
@@ -265,8 +266,17 @@ __global__ void generate_sequence_kernel(
     __shared__ typename BlockReduce::TempStorage temp_storage;
     __shared__ AccumType shared_scalar;
 
+    // Shared memory for generated tokens (for presence penalty)
+    __shared__ TokenType s_gen_tokens[256]; 
+
     int total_len = seed_len + gen_len;
     size_t kv_layer_stride = 2ULL * total_len * HIDDEN_DIM;
+
+    // Load initial seed tokens to shared memory
+    if (tid < seed_len && tid < 256) {
+        s_gen_tokens[tid] = buffer[tid];
+    }
+    __syncthreads();
 
     for (int t = 0; t < total_len - 1; t++) { 
         __syncthreads(); 
@@ -309,6 +319,10 @@ __global__ void generate_sequence_kernel(
 
         // --- Three-Pass Sampling (Loop-based) ---
         
+        // Precompute constants
+        int32_t penalty_int = (int32_t)(penalty * (1 << SHIFT_LOGIT));
+        int32_t min_p_limit = (int32_t)(logf(min_p) * SOFTMAX_EXP_SCALE);
+
         // Pass 1: Find Max Logit
         int32_t local_max = INT_MIN;
         const int32_t *wh_p = (const int32_t*)model->embedding;
@@ -317,6 +331,14 @@ __global__ void generate_sequence_kernel(
         for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
             AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
             int32_t lgt = ah >> SHIFT_LOGIT;
+            
+            // Presence Penalty
+            for (int i = 0; i <= t; i++) {
+                if (s_gen_tokens[i] == (TokenType)v) {
+                    lgt -= penalty_int;
+                }
+            }
+
             if (lgt > local_max) local_max = lgt;
         }
         
@@ -331,8 +353,23 @@ __global__ void generate_sequence_kernel(
         for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
             AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
             int32_t lgt = ah >> SHIFT_LOGIT;
+            
+            // Presence Penalty
+            for (int i = 0; i <= t; i++) {
+                if (s_gen_tokens[i] == (TokenType)v) {
+                    lgt -= penalty_int;
+                }
+            }
+
             int32_t shifted = lgt - global_max;
-            local_sum_ex += softmax_exp_lookup(shifted);
+            
+            // Temperature Scaling
+            int32_t scaled_diff = (int32_t)(shifted / temp);
+
+            // Min-p Filtering
+            if (scaled_diff >= min_p_limit) {
+                local_sum_ex += softmax_exp_lookup(scaled_diff);
+            }
         }
         
         typedef cub::BlockReduce<long long, EGG_BLOCK_THREADS> BlockReduce64;
@@ -360,8 +397,24 @@ __global__ void generate_sequence_kernel(
             for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
                 AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
                 int32_t lgt = ah >> SHIFT_LOGIT;
+                
+                // Presence Penalty
+                for (int i = 0; i <= t; i++) {
+                    if (s_gen_tokens[i] == (TokenType)v) {
+                        lgt -= penalty_int;
+                    }
+                }
+
                 int32_t shifted = lgt - global_max;
-                int32_t ex = softmax_exp_lookup(shifted);
+                
+                // Temperature Scaling
+                int32_t scaled_diff = (int32_t)(shifted / temp);
+
+                // Min-p Filtering
+                int32_t ex = 0;
+                if (scaled_diff >= min_p_limit) {
+                    ex = softmax_exp_lookup(scaled_diff);
+                }
                 
                 running += ex;
                 if (running > s_thresh) {
@@ -375,6 +428,7 @@ __global__ void generate_sequence_kernel(
         if (t >= seed_len - 1) {
             if (tid == 0) {
                 buffer[t + 1] = (TokenType)s_selected;
+                if (t + 1 < 256) s_gen_tokens[t + 1] = (TokenType)s_selected;
             }
         }
         __syncthreads();

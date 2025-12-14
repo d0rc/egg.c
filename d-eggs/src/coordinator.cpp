@@ -19,6 +19,7 @@
 #include "utils/egg_math.h"
 #include "utils/training.h"
 #include "utils/log.h"
+#include "utils/ternary_pack.h"
 
 // Constants
 #define PORT 12345
@@ -40,13 +41,14 @@ struct GlobalState {
     std::map<uint64_t, std::vector<int32_t>> fitness_history;
     
     // Current Step State
-    std::vector<int32_t> current_losses; // Size: POPULATION_SIZE
-    std::vector<bool> chunk_completed;   // Size: POPULATION_SIZE / CHUNK_SIZE
-    std::vector<bool> chunk_in_progress; // Size: POPULATION_SIZE / CHUNK_SIZE - tracks assigned but not completed
+    std::vector<int32_t> current_fitness; // Size: POPULATION_SIZE / 2
+    int64_t step_sum_loss = 0;            // Aggregated loss for current step
+    std::vector<bool> chunk_completed;    // Size: POPULATION_SIZE / CHUNK_SIZE
+    std::vector<bool> chunk_in_progress;  // Size: POPULATION_SIZE / CHUNK_SIZE
     std::vector<std::chrono::steady_clock::time_point> chunk_assign_time; // When each chunk was last assigned
-    std::deque<int> chunk_queue;         // Queue of chunks to assign
+    std::deque<int> chunk_queue;          // Queue of chunks to assign
     int chunks_remaining = 0;
-    uint64_t step_total_updates = 0;     // Aggregated updates for current step
+    uint64_t step_total_updates = 0;      // Aggregated updates for current step
     uint64_t step_min_updates = UINT64_MAX;
     uint64_t step_max_updates = 0;
     uint64_t step_transmissions = 0;
@@ -159,11 +161,16 @@ void handle_client(int sock) {
                 if (it != g_state.fitness_history.end()) {
                     const auto& fit = it->second;
                     
+                    // Pack fitness
+                    size_t packed_size = ternary_pack_estimate_size(fit.size());
+                    std::vector<uint8_t> packed_fit(packed_size);
+                    ternary_pack(fit.data(), fit.size(), packed_fit.data());
+                    
                     EggJobResponseHeader resp;
                     resp.seed = g_state.current_seed; // Not used for update, but keep consistent
                     resp.last_step = req.last_step + 1; // Target step
                     resp.data_position = 0;
-                    resp.model_size = fit.size() * sizeof(int32_t);
+                    resp.model_size = packed_size;
                     
                     // Serialize header
                     uint8_t resp_buf[28];
@@ -177,7 +184,7 @@ void handle_client(int sock) {
                     
                     send(sock, packet_header, EGG_HEADER_SIZE, 0);
                     send(sock, resp_buf, 28, 0);
-                    send(sock, fit.data(), resp.model_size, 0);
+                    send(sock, packed_fit.data(), resp.model_size, 0);
                     
                     continue; // Loop to let client apply update
                 } else {
@@ -266,12 +273,15 @@ void handle_client(int sock) {
             
         } else if (opcode == OP_RESULT) {
             EggResultHeader res;
-            if (payload_len < 36) break;  // Updated from 28 to 36
+            if (payload_len < 44) break;  // Updated from 36 to 44
             egg_deserialize_result_header(payload.data(), &res);
             
             int chunk_idx = res.data_position / CHUNK_SIZE;
-            int count = res.result_size / sizeof(int32_t);
-            const int32_t* losses = (const int32_t*)(payload.data() + 36);  // Updated from 28 to 36
+            
+            // Unpack fitness
+            int num_fitness = CHUNK_SIZE / 2;
+            std::vector<int32_t> h_fit(num_fitness);
+            ternary_unpack(payload.data() + 44, num_fitness, h_fit.data());
             
             std::lock_guard<std::mutex> lock(g_state.mutex);
             
@@ -289,10 +299,14 @@ void handle_client(int sock) {
                     g_state.chunk_completed[chunk_idx] = true;
                     g_state.chunks_remaining--;
                     
-                    // Copy losses
-                    for(int i=0; i<count; i++) {
-                        if (res.data_position + i < POPULATION_SIZE) {
-                            g_state.current_losses[res.data_position + i] = losses[i];
+                    // Accumulate Loss
+                    g_state.step_sum_loss += res.sum_loss;
+                    
+                    // Copy fitness
+                    int start_fit_idx = res.data_position / 2;
+                    for(int i=0; i<num_fitness; i++) {
+                        if (start_fit_idx + i < g_state.current_fitness.size()) {
+                            g_state.current_fitness[start_fit_idx + i] = h_fit[i];
                         }
                     }
                     
@@ -300,13 +314,8 @@ void handle_client(int sock) {
                     
                     if (g_state.chunks_remaining == 0) {
                         // Step Complete
-                        std::vector<int32_t> fitnesses;
-                        compute_fitness(g_state.current_losses, fitnesses);
-                        
                         // Calculate Avg Loss
-                        long long total_loss = 0;
-                        for(int32_t l : g_state.current_losses) total_loss += l;
-                        double avg_loss = (double)total_loss / (POPULATION_SIZE * SEQ_LEN * 16.0);
+                        double avg_loss = (double)g_state.step_sum_loss / (POPULATION_SIZE * SEQ_LEN * 16.0);
                         
                         // Calculate Time and Speed
                         auto now = std::chrono::steady_clock::now();
@@ -329,7 +338,7 @@ void handle_client(int sock) {
                                        g_state.step_total_updates, current_lr);
 
                         // Store history
-                        g_state.fitness_history[g_state.current_step] = fitnesses;
+                        g_state.fitness_history[g_state.current_step] = g_state.current_fitness;
                         if (g_state.fitness_history.size() > MAX_HISTORY) {
                             g_state.fitness_history.erase(g_state.fitness_history.begin());
                         }
@@ -346,7 +355,8 @@ void handle_client(int sock) {
                         g_state.chunk_queue.clear();
                         for(int i=0; i<total_chunks; i++) g_state.chunk_queue.push_back(i);
                         
-                        std::fill(g_state.current_losses.begin(), g_state.current_losses.end(), 0);
+                        std::fill(g_state.current_fitness.begin(), g_state.current_fitness.end(), 0);
+                        g_state.step_sum_loss = 0;
                         g_state.step_total_updates = 0;  // Reset updates counter
                         g_state.step_min_updates = UINT64_MAX;
                         g_state.step_max_updates = 0;
@@ -372,7 +382,7 @@ int main(int argc, char** argv) {
     signal(SIGTERM, signal_handler);
     
     // Init State
-    g_state.current_losses.resize(POPULATION_SIZE);
+    g_state.current_fitness.resize(POPULATION_SIZE / 2);
     int total_chunks = POPULATION_SIZE / CHUNK_SIZE;
     g_state.chunk_completed.resize(total_chunks, false);
     g_state.chunk_in_progress.resize(total_chunks, false);

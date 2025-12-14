@@ -15,6 +15,7 @@
 #include "../include/utils/io.h"
 #include "../include/utils/egg_math.h"
 #include "../include/utils/training.h"
+#include "../include/utils/ternary_pack.h"
 #include "../include/optimizer/adam.cuh"
 #include "kernels.cu"
 
@@ -273,8 +274,13 @@ int main(int argc, char** argv) {
             if (resp.model_size > 0) {
                 // Update Model
                 printf("[Worker] Updating model to Step %lu...\n", resp.last_step);
-                const int32_t* fitnesses = (const int32_t*)(payload.data() + 28);
-                cudaMemcpy(d_fit, fitnesses, resp.model_size, cudaMemcpyHostToDevice);
+                
+                // Unpack fitness
+                size_t num_fitness = POPULATION_SIZE / 2;
+                std::vector<int32_t> h_fit(num_fitness);
+                ternary_unpack(payload.data() + 28, num_fitness, h_fit.data());
+                
+                cudaMemcpy(d_fit, h_fit.data(), num_fitness * sizeof(int32_t), cudaMemcpyHostToDevice);
                 
                 float lr = get_learning_rate(current_step);
                 
@@ -369,7 +375,8 @@ int main(int argc, char** argv) {
                 
                 size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM);
                 generate_sequence_kernel<<<1, EGG_BLOCK_THREADS, sm_size>>>(
-                    d_gen_buf, gen_seed_len, gen_output_len, d_model, d_gen_kv, current_seed+999
+                    d_gen_buf, gen_seed_len, gen_output_len, d_model, d_gen_kv, current_seed+999,
+                    SAMPLING_TEMP, SAMPLING_MIN_P, SAMPLING_PRESENCE_PENALTY
                 );
                 cudaDeviceSynchronize();
                 
@@ -434,25 +441,42 @@ int main(int argc, char** argv) {
             std::vector<int32_t> h_loss(count);
             cudaMemcpy(h_loss.data(), d_loss, count * sizeof(int32_t), cudaMemcpyDeviceToHost);
             
+            // Compute Fitness & Sum Loss
+            int64_t sum_loss = 0;
+            int num_fitness = count / 2;
+            std::vector<int32_t> h_fit(num_fitness);
+            for(int i=0; i<num_fitness; i++) {
+                int32_t p = h_loss[2*i];
+                int32_t n = h_loss[2*i+1];
+                sum_loss += p + n;
+                h_fit[i] = (p < n) ? 1 : ((n < p) ? -1 : 0);
+            }
+            
+            // Pack
+            size_t packed_size = ternary_pack_estimate_size(num_fitness);
+            std::vector<uint8_t> packed_fit(packed_size);
+            ternary_pack(h_fit.data(), num_fitness, packed_fit.data());
+            
             // Send Result
             EggResultHeader res;
             res.seed = current_seed;
             res.last_step = current_step;
             res.data_position = resp.data_position;
             res.updates_count = last_updates_count;
-            res.result_size = count * sizeof(int32_t);
+            res.sum_loss = sum_loss;
+            res.result_size = packed_size;
             
             last_updates_count = 0; // Reset so we don't double count if we process multiple chunks
             
-            uint8_t res_buf[36];
+            uint8_t res_buf[44];
             egg_serialize_result_header(res_buf, &res);
             
             uint8_t packet_header[EGG_HEADER_SIZE];
-            egg_write_header(packet_header, OP_RESULT, 36 + res.result_size);
+            egg_write_header(packet_header, OP_RESULT, 44 + res.result_size);
             
             send(sock, packet_header, EGG_HEADER_SIZE, 0);
-            send(sock, res_buf, 36, 0);
-            send(sock, h_loss.data(), res.result_size, 0);
+            send(sock, res_buf, 44, 0);
+            send(sock, packed_fit.data(), res.result_size, 0);
             
             // std::cout << "Computed Chunk " << chunk_idx << " for Step " << current_step << std::endl;
         }

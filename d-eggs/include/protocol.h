@@ -116,12 +116,13 @@ static inline void egg_deserialize_job_response_header(const uint8_t *buf, EggJo
     res->model_size = ntohl(m);
 }
 
-// RESULT Header (36 bytes + result_data)
+// RESULT Header (44 bytes + result_data)
 typedef struct {
     uint64_t seed;
     uint64_t last_step;
     uint64_t data_position;
     uint64_t updates_count; // Added field
+    uint64_t sum_loss;      // Added field (int64_t packed as uint64_t)
     uint32_t result_size;
     // Followed by result_data
 } EggResultHeader;
@@ -131,26 +132,30 @@ static inline void egg_serialize_result_header(uint8_t *buf, const EggResultHead
     uint64_t l = htonll(res->last_step);
     uint64_t d = htonll(res->data_position);
     uint64_t u = htonll(res->updates_count);
+    uint64_t sl = htonll(res->sum_loss);
     uint32_t r = htonl(res->result_size);
     memcpy(buf, &s, 8);
     memcpy(buf + 8, &l, 8);
     memcpy(buf + 16, &d, 8);
     memcpy(buf + 24, &u, 8);
-    memcpy(buf + 32, &r, 4);
+    memcpy(buf + 32, &sl, 8);
+    memcpy(buf + 40, &r, 4);
 }
 
 static inline void egg_deserialize_result_header(const uint8_t *buf, EggResultHeader *res) {
-    uint64_t s, l, d, u;
+    uint64_t s, l, d, u, sl;
     uint32_t r;
     memcpy(&s, buf, 8);
     memcpy(&l, buf + 8, 8);
     memcpy(&d, buf + 16, 8);
     memcpy(&u, buf + 24, 8);
-    memcpy(&r, buf + 32, 4);
+    memcpy(&sl, buf + 32, 8);
+    memcpy(&r, buf + 40, 4);
     res->seed = ntohll(s);
     res->last_step = ntohll(l);
     res->data_position = ntohll(d);
     res->updates_count = ntohll(u);
+    res->sum_loss = ntohll(sl);
     res->result_size = ntohl(r);
 }
 
