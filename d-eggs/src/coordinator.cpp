@@ -37,8 +37,8 @@ struct GlobalState {
     uint64_t current_seed = 42; // Initial seed
     
     // History of fitness vectors for catch-up
-    // Map step -> vector
-    std::map<uint64_t, std::vector<int32_t>> fitness_history;
+    // Map step -> vector (packed)
+    std::map<uint64_t, std::vector<uint8_t>> fitness_history;
     
     // Current Step State
     std::vector<int32_t> current_fitness; // Size: POPULATION_SIZE / 2
@@ -162,18 +162,13 @@ void handle_client(int sock) {
                 
                 auto it = g_state.fitness_history.find(req.last_step);
                 if (it != g_state.fitness_history.end()) {
-                    const auto& fit = it->second;
-                    
-                    // Pack fitness
-                    size_t packed_size = ternary_pack_estimate_size(fit.size());
-                    std::vector<uint8_t> packed_fit(packed_size);
-                    ternary_pack(fit.data(), fit.size(), packed_fit.data());
+                    const auto& packed_fit = it->second;
                     
                     EggJobResponseHeader resp;
                     resp.seed = g_state.current_seed; // Not used for update, but keep consistent
                     resp.last_step = req.last_step + 1; // Target step
                     resp.data_position = 0;
-                    resp.model_size = packed_size;
+                    resp.model_size = packed_fit.size();
                     
                     // Serialize header
                     uint8_t resp_buf[28];
@@ -362,8 +357,12 @@ void handle_client(int sock) {
                         egg_log_record(&g_log_state, g_state.current_step, avg_loss, 
                                        g_state.step_total_updates, current_lr);
 
-                        // Store history
-                        g_state.fitness_history[g_state.current_step] = g_state.current_fitness;
+                        // Store history (packed)
+                        size_t packed_size = ternary_pack_estimate_size(g_state.current_fitness.size());
+                        std::vector<uint8_t> packed_fit(packed_size);
+                        ternary_pack(g_state.current_fitness.data(), g_state.current_fitness.size(), packed_fit.data());
+                        g_state.fitness_history[g_state.current_step] = packed_fit;
+
                         if (g_state.fitness_history.size() > MAX_HISTORY) {
                             g_state.fitness_history.erase(g_state.fitness_history.begin());
                         }

@@ -3,10 +3,11 @@
 
 // Learning rate schedule for training
 inline float get_learning_rate(long step) {
-    if (step < 30) return 0.5f;
-    if (step < 600) return 0.1f;
-    if (step < 1000) return 0.05f;
-    return 0.01f;
+    if (step < 20) return 0.5f;
+    if (step < 190) return 0.25f;
+    if (step < 200) return 0.125f;
+    if (step < 400) return 0.0625f;
+    return 0.03f;
 }
 
 #endif // EGG_TRAINING_H

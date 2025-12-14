@@ -285,7 +285,8 @@ int main(int argc, char** argv) {
                 float lr = get_learning_rate(current_step);
                 
                 // Reset updates counter
-                cudaMemset(&d_total_updates, 0, sizeof(unsigned long long));
+                unsigned long long zero = 0;
+                cudaMemcpyToSymbol(d_total_updates, &zero, sizeof(unsigned long long));
 
                 // Run Updates
                 #define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
