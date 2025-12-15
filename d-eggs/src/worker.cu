@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cuda_runtime.h>
+#include <csignal>
 
 #include "../include/protocol.h"
 #include "../include/config.h"
@@ -22,6 +23,9 @@
 // Network Stats
 std::atomic<uint64_t> bytes_sent(0);
 std::atomic<uint64_t> bytes_received(0);
+volatile bool g_running = true;
+
+void sig_handler(int) { g_running = false; }
 
 // --- Vocabulary for Detokenization (when USE_TOKENIZER is defined) ---
 #if USE_TOKENIZER
@@ -234,6 +238,9 @@ int main(int argc, char** argv) {
     // 1. Init CUDA & Model
     int device_id = 0;
     cudaGetDevice(&device_id);
+
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
     
     init_tables();
     copy_tables_to_device();
@@ -317,6 +324,25 @@ int main(int argc, char** argv) {
     // Buffers
     int32_t *d_loss; allocate_managed((void**)&d_loss, POPULATION_SIZE * sizeof(int32_t), device_id); // Max size
     int32_t *d_fit; allocate_managed((void**)&d_fit, (POPULATION_SIZE/2) * sizeof(int32_t), device_id);
+    
+    // Graph Update Params
+    uint32_t *d_update_seed; 
+    float *d_update_lr;
+    float *d_update_lr_bias;
+    cudaMalloc(&d_update_seed, sizeof(uint32_t));
+    cudaMalloc(&d_update_lr, sizeof(float));
+    cudaMalloc(&d_update_lr_bias, sizeof(float));
+    
+    void* ptr_total_updates;
+    cudaGetSymbolAddress(&ptr_total_updates, d_total_updates);
+    
+    cudaStream_t update_stream;
+    cudaStreamCreate(&update_stream);
+    
+    cudaGraph_t update_graph;
+    cudaGraphExec_t update_instance = NULL;
+    bool graph_created = false;
+
     ActType *d_kv_cache; 
     size_t kv_size = (size_t)POPULATION_BATCH_SIZE * N_LAYERS * 2 * SEQ_LEN * HIDDEN_DIM; // Approx
     allocate_managed((void**)&d_kv_cache, kv_size, device_id); // Need to ensure enough for chunk size
@@ -348,7 +374,7 @@ int main(int argc, char** argv) {
     std::cout << "Connected to " << server_ip << std::endl;
 
     // 3. Loop
-    while (true) {
+    while (g_running) {
         // Send JOB_REQUEST
         EggJobRequest req;
         req.seed = current_seed;
@@ -386,69 +412,93 @@ int main(int argc, char** argv) {
                 cudaMemcpy(d_fit, h_fit.data(), num_fitness * sizeof(int32_t), cudaMemcpyHostToDevice);
                 
                 float lr = get_learning_rate(current_step);
+                float lr_bias = lr * 0.1f;
                 
-                // Reset updates counter
-                unsigned long long zero = 0;
-                cudaMemcpyToSymbol(d_total_updates, &zero, sizeof(unsigned long long));
+                // Update seed/lr on device
+                cudaMemcpyAsync(d_update_seed, &current_seed, sizeof(uint32_t), cudaMemcpyHostToDevice, update_stream);
+                cudaMemcpyAsync(d_update_lr, &lr, sizeof(float), cudaMemcpyHostToDevice, update_stream);
+                cudaMemcpyAsync(d_update_lr_bias, &lr_bias, sizeof(float), cudaMemcpyHostToDevice, update_stream);
 
-                // Run Updates
-                #define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
-                    update_matrix_adam_kernel<<< (ROWS*COLS+511)/512, 512 >>>( \
-                    (WeightType*)M_PTR, (AdamParam*)ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, \
-                    BASE, d_fit, current_seed, lr)
+                if (!graph_created) {
+                    printf("[Worker] Capturing CUDA Graph for Optimizer Step...\n");
+                    auto start_cap = std::chrono::high_resolution_clock::now();
+                    
+                    cudaStreamBeginCapture(update_stream, cudaStreamCaptureModeGlobal);
+                    
+                    // Reset updates counter
+                    cudaMemsetAsync(ptr_total_updates, 0, sizeof(unsigned long long), update_stream);
 
-                #define LAUNCH_ADAM_VECTOR(V_PTR, ADAM_PTR, LEN, SEED_A, SEED_B, BASE, LR_SCALE) \
-                    update_vector_adam_kernel<<< (LEN+255)/256, 256 >>>( \
-                    (WeightType*)V_PTR, (AdamParam*)ADAM_PTR, LEN, SEED_A, SEED_B, \
-                    BASE, d_fit, current_seed, lr * LR_SCALE)
+                    // Run Updates
+                    #define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
+                        update_matrix_adam_kernel<<< (ROWS*COLS+511)/512, 512, 0, update_stream >>>( \
+                        (WeightType*)M_PTR, (AdamParam*)ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, \
+                        BASE, d_fit, d_update_seed, d_update_lr)
 
-                for(int l=0; l<N_LAYERS; l++) {
-                    int s_base = l * 1000;
-                    LAUNCH_ADAM_MATRIX(d_ptrs.w_q[l], d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base);
-                    LAUNCH_ADAM_MATRIX(d_ptrs.w_k[l], d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base);
-                    LAUNCH_ADAM_MATRIX(d_ptrs.w_v[l], d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base);
-                    LAUNCH_ADAM_MATRIX(d_ptrs.w_o[l], d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base);
+                    #define LAUNCH_ADAM_VECTOR(V_PTR, ADAM_PTR, LEN, SEED_A, SEED_B, BASE, LR_PTR) \
+                        update_vector_adam_kernel<<< (LEN+255)/256, 256, 0, update_stream >>>( \
+                        (WeightType*)V_PTR, (AdamParam*)ADAM_PTR, LEN, SEED_A, SEED_B, \
+                        BASE, d_fit, d_update_seed, LR_PTR)
+
+                    for(int l=0; l<N_LAYERS; l++) {
+                        int s_base = l * 1000;
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_q[l], d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_k[l], d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_v[l], d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_o[l], d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base);
+                        
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_up[l], d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_down[l], d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base);
+                        
+                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_1[l], d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1_A, SEED_OFF_LN_1_B, s_base, d_update_lr);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_1_bias[l], d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS_A, SEED_OFF_LN_1_BIAS_B, s_base, d_update_lr);
+                        
+                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_2[l], d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2_A, SEED_OFF_LN_2_B, s_base, d_update_lr);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_2_bias[l], d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS_A, SEED_OFF_LN_2_BIAS_B, s_base, d_update_lr);
+                        
+                        LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_up[l], d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP_A, SEED_OFF_MLP_BIAS_UP_B, s_base, d_update_lr);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_down[l], d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN_A, SEED_OFF_MLP_BIAS_DOWN_B, s_base, d_update_lr);
+                    }
                     
-                    LAUNCH_ADAM_MATRIX(d_ptrs.w_up[l], d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base);
-                    LAUNCH_ADAM_MATRIX(d_ptrs.w_down[l], d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_f, d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, 0, d_update_lr);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_f_bias, d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, 0, d_update_lr);
                     
-                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_1[l], d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1_A, SEED_OFF_LN_1_B, s_base, 1.0f);
-                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_1_bias[l], d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS_A, SEED_OFF_LN_1_BIAS_B, s_base, 1.0f);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_init, d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT_A, SEED_OFF_LN_INIT_B, 0, d_update_lr);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_init_bias, d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS_A, SEED_OFF_LN_INIT_BIAS_B, 0, d_update_lr);
+
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_up, d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_up, d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP_A, SEED_OFF_EMB_MLP_BIAS_UP_B, 0, d_update_lr);
+
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_down, d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_down, d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B, 0, d_update_lr);
+
+                    LAUNCH_ADAM_VECTOR(d_ptrs.emb_bias, d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS_A, SEED_OFF_EMB_BIAS_B, 0, d_update_lr_bias);
                     
-                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_2[l], d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2_A, SEED_OFF_LN_2_B, s_base, 1.0f);
-                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_2_bias[l], d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS_A, SEED_OFF_LN_2_BIAS_B, s_base, 1.0f);
+                    update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512, 0, update_stream >>>(
+                        (WeightType*)d_ptrs.embedding, 
+                        (AdamParam*)d_adam_state->embedding, 
+                        HIDDEN_DIM, VOCAB_SIZE, 
+                        SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 
+                        0, d_fit, d_update_seed, d_update_lr
+                    );
                     
-                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_up[l], d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP_A, SEED_OFF_MLP_BIAS_UP_B, s_base, 1.0f);
-                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_down[l], d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN_A, SEED_OFF_MLP_BIAS_DOWN_B, s_base, 1.0f);
+                    cudaStreamEndCapture(update_stream, &update_graph);
+                    cudaGraphInstantiate(&update_instance, update_graph, NULL, NULL, 0);
+                    graph_created = true;
+                    
+                    auto end_cap = std::chrono::high_resolution_clock::now();
+                    std::chrono::duration<double, std::milli> ms = end_cap - start_cap;
+                    
+                    size_t num_nodes = 0;
+                    cudaGraphGetNodes(update_graph, NULL, &num_nodes);
+                    printf("[Worker] Graph captured: %zu nodes in %.2f ms\n", num_nodes, ms.count());
                 }
                 
-                LAUNCH_ADAM_VECTOR(d_ptrs.ln_f, d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, 0, 1.0f);
-                LAUNCH_ADAM_VECTOR(d_ptrs.ln_f_bias, d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, 0, 1.0f);
-                
-                LAUNCH_ADAM_VECTOR(d_ptrs.ln_init, d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT_A, SEED_OFF_LN_INIT_B, 0, 1.0f);
-                LAUNCH_ADAM_VECTOR(d_ptrs.ln_init_bias, d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS_A, SEED_OFF_LN_INIT_BIAS_B, 0, 1.0f);
-
-                LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_up, d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0);
-                LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_up, d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP_A, SEED_OFF_EMB_MLP_BIAS_UP_B, 0, 1.0f);
-
-                LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_down, d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0);
-                LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_down, d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B, 0, 1.0f);
-
-                LAUNCH_ADAM_VECTOR(d_ptrs.emb_bias, d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS_A, SEED_OFF_EMB_BIAS_B, 0, 0.1f);
-                
-                update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512 >>>(
-                    (WeightType*)d_ptrs.embedding, 
-                    (AdamParam*)d_adam_state->embedding, 
-                    HIDDEN_DIM, VOCAB_SIZE, 
-                    SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 
-                    0, d_fit, current_seed, lr
-                );
-                
-                cudaDeviceSynchronize();
+                cudaGraphLaunch(update_instance, update_stream);
                 
                 // Read updates count
                 unsigned long long updates = 0;
-                cudaMemcpyFromSymbol(&updates, d_total_updates, sizeof(unsigned long long));
+                cudaMemcpyAsync(&updates, ptr_total_updates, sizeof(unsigned long long), cudaMemcpyDeviceToHost, update_stream);
+                cudaStreamSynchronize(update_stream);
                 last_updates_count = updates;
 
                 current_step = resp.last_step; // Should be current_step + 1
@@ -613,5 +663,6 @@ int main(int argc, char** argv) {
         }
     }
     
+    printf("\n[Worker] Goodbye!\n");
     return 0;
 }

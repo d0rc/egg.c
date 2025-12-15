@@ -35,8 +35,8 @@ __global__ void update_matrix_adam_kernel(
     int off_A, int off_B, 
     int seed_base, 
     const int32_t *fitnesses, 
-    uint32_t step_seed,
-    float learning_rate
+    const uint32_t *step_seed,
+    const float *learning_rate
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -54,16 +54,19 @@ __global__ void update_matrix_adam_kernel(
         
         // Approximate Gradient Computation
         VoteType vote = 0;
+        uint32_t base_s = *step_seed;
+        float lr = *learning_rate;
+
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
-            uint32_t s = step_seed + p + seed_base;
+            uint32_t s = base_s + p + seed_base;
             // Use k for input noise (off_B), tid for output noise (off_A)
             vote += (VoteType)fit * noise_from_hash(s + off_A, tid) * noise_from_hash(s + off_B, k);
         }
         
         WeightType w = W[idx];
         AdamParam p = adam_state[idx];
-        apply_adam_update(p, w, -(float)vote, learning_rate, change);
+        apply_adam_update(p, w, -(float)vote, lr, change);
         W[idx] = w;
         adam_state[idx] = p;
     }
@@ -82,8 +85,8 @@ __global__ void update_vector_adam_kernel(
     int off_A, int off_B,
     int seed_base, 
     const int32_t *fitnesses, 
-    uint32_t step_seed,
-    float learning_rate
+    const uint32_t *step_seed,
+    const float *learning_rate
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -94,17 +97,20 @@ __global__ void update_vector_adam_kernel(
     int change = 0;
     if (idx < len) {
         VoteType vote = 0;
+        uint32_t base_s = *step_seed;
+        float lr = *learning_rate;
+
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
             // Universal Rank-1 Noise: Gradient is fit * (N1 * N2)
-            VoteType n1 = (VoteType)noise_from_hash(step_seed + p + seed_base + off_A, idx);
-            VoteType n2 = (VoteType)noise_from_hash(step_seed + p + seed_base + off_B, idx);
+            VoteType n1 = (VoteType)noise_from_hash(base_s + p + seed_base + off_A, idx);
+            VoteType n2 = (VoteType)noise_from_hash(base_s + p + seed_base + off_B, idx);
             vote += (VoteType)fit * n1 * n2;
         }
         
         WeightType v_val = V[idx];
         AdamParam p = adam_state[idx];
-        apply_adam_update(p, v_val, -(float)vote, learning_rate, change);
+        apply_adam_update(p, v_val, -(float)vote, lr, change);
         V[idx] = v_val;
         adam_state[idx] = p;
     }
