@@ -446,12 +446,39 @@ int main(int argc, char** argv) {
             int64_t sum_loss = 0;
             int num_fitness = count / 2;
             std::vector<int32_t> h_fit(num_fitness);
+
+#if USE_ADAPTIVE_THRESHOLD
+            // Adaptive Thresholding: Filter out weak signals based on Mean Absolute Difference
+            double sum_abs_diff = 0.0;
+            std::vector<int32_t> diffs(num_fitness);
+            
+            for(int i=0; i<num_fitness; i++) {
+                int32_t p = h_loss[2*i];
+                int32_t n = h_loss[2*i+1];
+                sum_loss += p + n;
+                diffs[i] = n - p; // Positive if p < n (p is better -> +1)
+                sum_abs_diff += std::abs((double)diffs[i]);
+            }
+            
+            double mad = sum_abs_diff / num_fitness;
+            double threshold = mad * ADAPTIVE_THRESHOLD_ALPHA;
+            
+            for(int i=0; i<num_fitness; i++) {
+                if (std::abs((double)diffs[i]) < threshold) {
+                    h_fit[i] = 0;
+                } else {
+                    h_fit[i] = (diffs[i] > 0) ? 1 : -1;
+                }
+            }
+#else
+            // Original Pairwise Comparison
             for(int i=0; i<num_fitness; i++) {
                 int32_t p = h_loss[2*i];
                 int32_t n = h_loss[2*i+1];
                 sum_loss += p + n;
                 h_fit[i] = (p < n) ? 1 : ((n < p) ? -1 : 0);
             }
+#endif
             
             // Pack
             size_t packed_size = ternary_pack_estimate_size(num_fitness);

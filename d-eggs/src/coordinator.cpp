@@ -24,7 +24,7 @@
 // Constants
 #define PORT 12345
 // CHUNK_SIZE is defined in config.h
-#define MAX_HISTORY 500
+#define MAX_HISTORY 5000
 #define STRAGGLER_TIMEOUT_MS 90000  // 90 seconds before re-assigning a chunk
 
 // Network Stats (global atomics)
@@ -95,6 +95,21 @@ std::string humanize_bytes(uint64_t bytes) {
         snprintf(buf, sizeof(buf), "%.2f KB", (double)bytes / 1024.0);
     } else {
         snprintf(buf, sizeof(buf), "%" PRIu64 " B", bytes);
+    }
+    return std::string(buf);
+}
+
+// Helper: Humanize tokens
+std::string humanize_tokens(uint64_t tokens) {
+    char buf[64];
+    if (tokens >= 1000ULL * 1000 * 1000) {
+        snprintf(buf, sizeof(buf), "%.2f B", (double)tokens / 1e9);
+    } else if (tokens >= 1000ULL * 1000) {
+        snprintf(buf, sizeof(buf), "%.2f M", (double)tokens / 1e6);
+    } else if (tokens >= 1000) {
+        snprintf(buf, sizeof(buf), "%.2f K", (double)tokens / 1e3);
+    } else {
+        snprintf(buf, sizeof(buf), "%" PRIu64, tokens);
     }
     return std::string(buf);
 }
@@ -340,12 +355,24 @@ void handle_client(int sock) {
                         }
                         const char* reset_color = "\033[0m";
 
+                        // Construct Updates String
+                        char updates_detail[128];
+                        if (g_state.step_min_updates == 0 || g_state.step_min_updates == g_state.step_max_updates) {
+                            snprintf(updates_detail, sizeof(updates_detail), "(n=%" PRIu64 ", max=%s%" PRIu64 "%s)", 
+                                     g_state.step_transmissions, updates_color, g_state.step_max_updates, reset_color);
+                        } else {
+                            snprintf(updates_detail, sizeof(updates_detail), "(n=%" PRIu64 ", min=%" PRIu64 ", max=%s%" PRIu64 "%s)", 
+                                     g_state.step_transmissions, g_state.step_min_updates, updates_color, g_state.step_max_updates, reset_color);
+                        }
+
+                        uint64_t total_tokens = g_state.current_step * POPULATION_SIZE * SEQ_LEN;
+
                         // Print Log
-                        printf("Step %" PRIu64 " | Loss: %s%.4f%s | Time: %.2f ms | Updates: %" PRIu64 " (n=%" PRIu64 ", min=%" PRIu64 ", max=%s%" PRIu64 "%s) | Speed: %.2f tok/s | LR: %.3f | Net: %.2f MB/s (Tx: %s, Rx: %s)\n", 
+                        printf("Step %" PRIu64 " | Tokens: %s | Loss: %s%.4f%s | Time: %.2f ms | Updates: %" PRIu64 " %s | Speed: %.2f tok/s | LR: %.3f | Net: %.2f MB/s (Tx: %s, Rx: %s)\n", 
                                g_state.current_step, 
+                               humanize_tokens(total_tokens).c_str(),
                                loss_color, avg_loss, reset_color,
-                               step_ms, g_state.step_total_updates, g_state.step_transmissions, g_state.step_min_updates, 
-                               updates_color, g_state.step_max_updates, reset_color,
+                               step_ms, g_state.step_total_updates, updates_detail,
                                tokens_per_sec, current_lr, net_mbps,
                                humanize_bytes(sent).c_str(), humanize_bytes(recv).c_str());
 

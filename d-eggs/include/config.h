@@ -190,10 +190,10 @@
 
 // Sampling Configuration
 #ifndef SAMPLING_TEMP
-#  define SAMPLING_TEMP 1.0f
+#  define SAMPLING_TEMP 0.6f
 #endif
 #ifndef SAMPLING_MIN_P
-#  define SAMPLING_MIN_P 0.05f
+#  define SAMPLING_MIN_P 0.08f
 #endif
 #ifndef SAMPLING_PRESENCE_PENALTY
 #  define SAMPLING_PRESENCE_PENALTY 0.2f
@@ -206,6 +206,14 @@
 #  ifndef MUON_LR_SCALE
 #    define MUON_LR_SCALE 1.0f
 #  endif
+#endif
+
+// Adaptive Thresholding for Winners Selection
+#ifndef USE_ADAPTIVE_THRESHOLD
+#  define USE_ADAPTIVE_THRESHOLD 1
+#endif
+#ifndef ADAPTIVE_THRESHOLD_ALPHA
+#  define ADAPTIVE_THRESHOLD_ALPHA 0.1f
 #endif
 
 #endif // EGG_CONFIG_H
