@@ -40,6 +40,20 @@ The system follows a **Coordinator-Worker** model designed for high throughput a
     *   **AdamW**: Implements the AdamW optimizer (`d-eggs/include/optimizer/adam.cuh`) with quantized updates, maintaining float moments while updating integer weights.
     *   **SGD / Quantized Update**: Uses a threshold-based update mechanism (`d-eggs/include/optimizer/sgd.cuh`) to bridge floating-point gradients with integer-only weights.
 
+## Generation & Sampling
+
+The worker implements a custom CUDA kernel for sequence generation:
+
+1.  **Presence Penalty**: Penalizes tokens that have already appeared in the sequence to reduce repetition.
+2.  **Temperature Scaling**: Adjusts the randomness of predictions. Higher temperature flattens the distribution.
+3.  **Min-P Sampling**: An efficient alternative to Top-P (Nucleus) sampling. It truncates the tail of the distribution by ignoring tokens with probability less than `min_p * max_prob`.
+4.  **Selection**: Performs a weighted random selection from the filtered distribution.
+
+Configuration via `include/config.h`:
+*   `SAMPLING_TEMP` (Default: 0.6)
+*   `SAMPLING_MIN_P` (Default: 0.08)
+*   `SAMPLING_PRESENCE_PENALTY` (Default: 0.2)
+
 ## Experimental Features (Disabled by Default)
 
 These features are implemented but disabled in `include/config.h`. Enable them by modifying the config or passing flags during compilation.
