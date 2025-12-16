@@ -77,6 +77,16 @@ A lightweight header-only tool for monitoring integer model stability and detect
 *   **Metrics**: Tracks Mean, StdDev, bit-level Entropy (0.00-8.00), and Saturation percentages per layer.
 *   **Usage**: Define `EGG_DEBUG` during compilation to enable ANSI-colored logs for activations and attention scores.
 
+<a id="distributed-implementation"></a>
+## Distributed Implementation (`d-eggs`)
+
+A robust, distributed training system designed to scale EGGROLL across multiple nodes and GPUs.
+
+For full documentation, architecture details, and usage instructions, please see [d-eggs/README.md](d-eggs/README.md).
+
+*   **Architecture**: Coordinator-Worker model with fault tolerance.
+*   **Key Features**: Custom Binary Protocol, CUDA Graphs, Ternary Packing, Muon Optimizer.
+
 <a id="configuration"></a>
 ## Configuration
 
