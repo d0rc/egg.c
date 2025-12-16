@@ -1,0 +1,5 @@
+#!/bin/bash
+CUDA_VISIBLE_DEVICES=0 ./worker 127.0.0.1 &
+CUDA_VISIBLE_DEVICES=1 ./worker 127.0.0.1 &
+CUDA_VISIBLE_DEVICES=2 ./worker 127.0.0.1 &
+CUDA_VISIBLE_DEVICES=3 ./worker 127.0.0.1 &

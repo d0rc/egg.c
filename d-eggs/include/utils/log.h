@@ -1,5 +1,5 @@
-#ifndef EGG_DISK_LOG_H
-#define EGG_DISK_LOG_H
+#ifndef EGG_UTILS_LOG_H
+#define EGG_UTILS_LOG_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +8,7 @@
 #include <string.h>
 
 #define EGG_API_BASE "https://jlbhiestcyjduotrkmwl.supabase.co/functions/v1"
-#define EGG_PROJECT_ID "dbe2f057-32c9-4248-8e7c-7158755fcc2c"
+#define EGG_PROJECT_ID "350e7662-d474-4e8a-946d-517fca656005"
 
 // Experiment name - can be overridden via -DEXPERIMENT_NAME=\"my_experiment\"
 #ifndef EXPERIMENT_NAME
@@ -263,4 +263,4 @@ static inline void egg_log_close(EggLogState *state) {
     }
 }
 
-#endif // EGG_DISK_LOG_H
+#endif // EGG_UTILS_LOG_H
