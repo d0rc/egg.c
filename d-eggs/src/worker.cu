@@ -326,7 +326,8 @@ int main(int argc, char** argv) {
     // Buffers
     int32_t *d_loss; allocate_managed((void**)&d_loss, POPULATION_SIZE * sizeof(int32_t), device_id); // Max size
     int32_t *d_fit; allocate_managed((void**)&d_fit, (POPULATION_SIZE/2) * sizeof(int32_t), device_id);
-    
+    uint32_t *d_chunk_shifts; allocate_managed((void**)&d_chunk_shifts, (POPULATION_SIZE/CHUNK_SIZE) * sizeof(uint32_t), device_id);
+
     // Adaptive Noise Scales
     AdaptiveScales *d_scales;
     allocate_managed((void**)&d_scales, sizeof(AdaptiveScales), device_id);
@@ -420,11 +421,24 @@ int main(int argc, char** argv) {
                 // Unpack fitness
                 size_t num_fitness = POPULATION_SIZE / 2;
                 std::vector<int32_t> h_fit(num_fitness);
-                ternary_unpack(payload.data() + 28, num_fitness, h_fit.data());
+                ternary_unpack(payload.data() + 32, num_fitness, h_fit.data());
                 
                 cudaMemcpy(d_fit, h_fit.data(), num_fitness * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+                // Extract Chunk Shifts
+                size_t packed_size = ternary_pack_estimate_size(num_fitness);
+                size_t shifts_offset = 32 + packed_size;
+                size_t total_chunks = POPULATION_SIZE / CHUNK_SIZE;
+                size_t shifts_size = total_chunks * sizeof(uint32_t);
                 
-                float lr = get_learning_rate(current_step);
+                if (payload.size() >= shifts_offset + shifts_size) {
+                    cudaMemcpy(d_chunk_shifts, payload.data() + shifts_offset, shifts_size, cudaMemcpyHostToDevice);
+                } else {
+                    // Fallback (should not happen with updated coordinator)
+                    cudaMemset(d_chunk_shifts, 0, shifts_size);
+                }
+                
+                float lr = resp.learning_rate;
                 float lr_bias = lr * 0.1f;
                 
                 // Update seed/lr on device
@@ -452,7 +466,7 @@ int main(int argc, char** argv) {
                         cudaMemsetAsync(d_col_accum, 0, COLS * sizeof(int), update_stream); \
                         update_matrix_adam_kernel<<< (ROWS*COLS+511)/512, 512, 0, update_stream >>>( \
                         (WeightType*)M_PTR, (AdamParam*)ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, \
-                        BASE, d_fit, d_update_seed, d_update_lr, d_row_accum, d_col_accum); \
+                        BASE, d_fit, d_update_seed, d_update_lr, d_chunk_shifts, d_row_accum, d_col_accum); \
                         UPDATE_OVERLAY(d_row_accum, ROW_OV, ROWS); \
                         UPDATE_OVERLAY(d_col_accum, COL_OV, COLS);
 
@@ -460,7 +474,7 @@ int main(int argc, char** argv) {
                         cudaMemsetAsync(d_row_accum, 0, LEN * sizeof(int), update_stream); \
                         update_vector_adam_kernel<<< (LEN+255)/256, 256, 0, update_stream >>>( \
                         (WeightType*)V_PTR, (AdamParam*)ADAM_PTR, LEN, SEED_A, SEED_B, \
-                        BASE, d_fit, d_update_seed, LR_PTR, d_row_accum); \
+                        BASE, d_fit, d_update_seed, LR_PTR, d_chunk_shifts, d_row_accum); \
                         UPDATE_OVERLAY(d_row_accum, OV, LEN);
 
                     for(int l=0; l<N_LAYERS; l++) {
@@ -504,7 +518,7 @@ int main(int argc, char** argv) {
                         (AdamParam*)d_adam_state->embedding, 
                         HIDDEN_DIM, VOCAB_SIZE, 
                         SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 
-                        0, d_fit, d_update_seed, d_update_lr,
+                        0, d_fit, d_update_seed, d_update_lr, d_chunk_shifts,
                         d_col_accum, d_row_accum // Note: Embedding is [HIDDEN, VOCAB]. Row=Hidden, Col=Vocab.
                         // Wait, repack_matrix packs it as [HIDDEN, VOCAB].
                         // So ROWS=HIDDEN, COLS=VOCAB.
@@ -557,6 +571,9 @@ int main(int argc, char** argv) {
             int chunk_idx = resp.data_position / CHUNK_SIZE;
             int count = CHUNK_SIZE;
             
+            // Use the seed provided by coordinator (which includes shift)
+            uint32_t task_seed = resp.seed;
+
             printf("[Worker] Processing Step %lu, Chunk %d\n", current_step, chunk_idx);
 
             // Generation (Chunk 0 only, every 5 steps)
@@ -566,7 +583,7 @@ int main(int argc, char** argv) {
                 
                 size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM);
                 generate_sequence_kernel<<<1, EGG_BLOCK_THREADS, sm_size>>>(
-                    d_gen_buf, gen_seed_len, gen_output_len, d_model, d_gen_kv, current_seed+999,
+                    d_gen_buf, gen_seed_len, gen_output_len, d_model, d_gen_kv, task_seed+999,
                     SAMPLING_TEMP, SAMPLING_MIN_P, SAMPLING_PRESENCE_PENALTY
                 );
                 cudaDeviceSynchronize();
@@ -625,7 +642,7 @@ int main(int argc, char** argv) {
             
             train_sequence_kernel<<<count, EGG_BLOCK_THREADS, sm_size>>>(
                 d_dataset, ds_len, current_step*SEQ_LEN, d_model, d_kv_cache, 
-                d_loss, current_seed, global_pop_offset, current_step, d_scales
+                d_loss, task_seed, global_pop_offset, current_step, d_scales
             );
             
             // Copy Result

@@ -37,6 +37,7 @@ __global__ void update_matrix_adam_kernel(
     const int32_t *fitnesses, 
     const uint32_t *step_seed,
     const float *learning_rate,
+    const uint32_t *chunk_shifts,
     int *row_accum = nullptr,
     int *col_accum = nullptr
 ) {
@@ -62,7 +63,11 @@ __global__ void update_matrix_adam_kernel(
 
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
-            uint32_t s = base_s + p + seed_base;
+            
+            int chunk_idx = p / (CHUNK_SIZE / 2);
+            uint32_t shift = chunk_shifts[chunk_idx];
+            
+            uint32_t s = base_s + p + seed_base + shift;
             // Use k for input noise (off_B), tid for output noise (off_A)
             vote += (VoteType)fit * noise_from_hash(s + off_A, tid) * noise_from_hash(s + off_B, k);
         }
@@ -96,6 +101,7 @@ __global__ void update_vector_adam_kernel(
     const int32_t *fitnesses, 
     const uint32_t *step_seed,
     const float *learning_rate,
+    const uint32_t *chunk_shifts,
     int *accum = nullptr
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -112,9 +118,15 @@ __global__ void update_vector_adam_kernel(
 
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
+            
+            int chunk_idx = p / (CHUNK_SIZE / 2);
+            uint32_t shift = chunk_shifts[chunk_idx];
+            
+            uint32_t s = base_s + p + seed_base + shift;
+            
             // Universal Rank-1 Noise: Gradient is fit * (N1 * N2)
-            VoteType n1 = (VoteType)noise_from_hash(base_s + p + seed_base + off_A, idx);
-            VoteType n2 = (VoteType)noise_from_hash(base_s + p + seed_base + off_B, idx);
+            VoteType n1 = (VoteType)noise_from_hash(s + off_A, idx);
+            VoteType n2 = (VoteType)noise_from_hash(s + off_B, idx);
             vote += (VoteType)fit * n1 * n2;
         }
         

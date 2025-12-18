@@ -6,7 +6,7 @@
 #include <arpa/inet.h> // for htonl, ntohl
 
 #define EGG_PROTO_MAGIC 0x4A4F4253 // "JOBS"
-#define EGG_PROTO_VERSION 1
+#define EGG_PROTO_VERSION 2
 
 // Opcodes
 #define OP_JOB_REQUEST  0
@@ -83,12 +83,13 @@ static inline void egg_deserialize_job_request(const uint8_t *buf, EggJobRequest
     req->data_position = ntohll(d);
 }
 
-// JOB_RESPONSE Header (28 bytes + model_data)
+// JOB_RESPONSE Header (32 bytes + model_data)
 typedef struct {
     uint64_t seed;
     uint64_t last_step;
     uint64_t data_position;
     uint32_t model_size;
+    float learning_rate; // Added in V2
     // Followed by model_data
 } EggJobResponseHeader;
 
@@ -97,23 +98,34 @@ static inline void egg_serialize_job_response_header(uint8_t *buf, const EggJobR
     uint64_t l = htonll(res->last_step);
     uint64_t d = htonll(res->data_position);
     uint32_t m = htonl(res->model_size);
+    
+    uint32_t lr_int;
+    memcpy(&lr_int, &res->learning_rate, 4);
+    lr_int = htonl(lr_int);
+    
     memcpy(buf, &s, 8);
     memcpy(buf + 8, &l, 8);
     memcpy(buf + 16, &d, 8);
     memcpy(buf + 24, &m, 4);
+    memcpy(buf + 28, &lr_int, 4);
 }
 
 static inline void egg_deserialize_job_response_header(const uint8_t *buf, EggJobResponseHeader *res) {
     uint64_t s, l, d;
-    uint32_t m;
+    uint32_t m, lr_int;
     memcpy(&s, buf, 8);
     memcpy(&l, buf + 8, 8);
     memcpy(&d, buf + 16, 8);
     memcpy(&m, buf + 24, 4);
+    memcpy(&lr_int, buf + 28, 4);
+    
     res->seed = ntohll(s);
     res->last_step = ntohll(l);
     res->data_position = ntohll(d);
     res->model_size = ntohl(m);
+    
+    lr_int = ntohl(lr_int);
+    memcpy(&res->learning_rate, &lr_int, 4);
 }
 
 // RESULT Header (44 bytes + result_data)

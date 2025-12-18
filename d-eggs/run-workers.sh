@@ -1,5 +1,20 @@
 #!/bin/bash
-CUDA_VISIBLE_DEVICES=0 ./worker 127.0.0.1 &
-CUDA_VISIBLE_DEVICES=1 ./worker 127.0.0.1 &
-CUDA_VISIBLE_DEVICES=2 ./worker 127.0.0.1 &
-CUDA_VISIBLE_DEVICES=3 ./worker 127.0.0.1 &
+
+# Detect available NVIDIA GPUs
+GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+
+if [ "$GPU_COUNT" -eq 0 ]; then
+    echo "No NVIDIA GPUs detected!"
+    exit 1
+fi
+
+echo "Detected $GPU_COUNT GPU(s), launching workers..."
+
+# Launch a worker for each GPU
+for GPU_ID in $(nvidia-smi --query-gpu=index --format=csv,noheader); do
+    echo "Starting worker on GPU $GPU_ID"
+    CUDA_VISIBLE_DEVICES=$GPU_ID ./worker 127.0.0.1 &
+done
+
+echo "All workers started."
+wait

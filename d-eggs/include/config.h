@@ -38,7 +38,7 @@
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 #ifndef CHUNK_SIZE
-#   define CHUNK_SIZE (8192*5)
+#   define CHUNK_SIZE (8192)
 #endif
 #ifndef POPULATION_BATCH_SIZE
 #   define POPULATION_BATCH_SIZE (CHUNK_SIZE * 1)
@@ -218,16 +218,32 @@
 
 // Chunk Mean Filter: Favor perturbations that align with chunk trend
 #ifndef CHUNK_MEAN_FILTER
-#  define CHUNK_MEAN_FILTER 1
+#  define CHUNK_MEAN_FILTER 0
 #endif
 #ifndef CHUNK_MEAN_EXPONENT
-#  define CHUNK_MEAN_EXPONENT 1.2
+#  define CHUNK_MEAN_EXPONENT 1.0
+#endif
+
+// Loss Haxxing (Retry chunks and pick best)
+#ifndef LOSS_HAXXING
+#  define LOSS_HAXXING 1
+#endif
+#ifndef LOSS_HAXXING_RETRIES
+#  define LOSS_HAXXING_RETRIES 3
+#endif
+// Direction: 'min', 'max', or 'mixed'
+#ifndef LOSS_HAXXING_DIRECTION
+#  define LOSS_HAXXING_DIRECTION 'mixed'
+#endif
+// Ratio of 'min' chunks when direction='mixed' (0.0 to 1.0, default 0.5 = 50/50)
+#ifndef LOSS_HAXXING_MIXED_RATIO
+#  define LOSS_HAXXING_MIXED_RATIO 0.5f
 #endif
 
 // Adaptive Noise (Noise-Trained Layer)
 // 0: Disabled (Scale 1.0), 1: Adaptive Scale, 2: Adaptive Gate
 #ifndef ADAPTIVE_NOISE_MODE
-#  define ADAPTIVE_NOISE_MODE 1
+#  define ADAPTIVE_NOISE_MODE 0
 #endif
 #define SEED_OFF_GATE 100000
 
