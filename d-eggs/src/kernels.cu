@@ -177,22 +177,24 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         compute_mlp(0, t, tid, s_x, s_mem, temp_storage, shared_scalar, model->ln_init, model->ln_init_bias, model->w_emb_mlp_up, model->mlp_emb_bias_up, model->w_emb_mlp_down, model->mlp_emb_bias_down, step_seed + pair_idx, ns, step, global_pop_offset, CFG_MLP_INIT, scales);
 
         // 2. Stack
-        for (int l = 0; l < N_LAYERS; l++) {
-            uint32_t seed_base = (step_seed + pair_idx) + (l * 1000);
-            
-            ActType* lkv_base = global_kv_cache + kv_ind_offset + (l * kv_layer_stride);
-            ActType* lkv_k = lkv_base;
-            ActType* lkv_v = lkv_base + SEQ_LEN*HIDDEN_DIM;
+        for (int cycle = 0; cycle < NUMBER_OF_CYCLES; cycle++) {
+            for (int l = 0; l < N_LAYERS; l++) {
+                uint32_t seed_base = (step_seed + pair_idx) + (cycle * N_LAYERS * 1000) + (l * 1000);
+                
+                ActType* lkv_base = global_kv_cache + kv_ind_offset + (l * kv_layer_stride);
+                ActType* lkv_k = lkv_base;
+                ActType* lkv_v = lkv_base + SEQ_LEN*HIDDEN_DIM;
 
-            compute_transformer_layer(
-                l, t, tid, model, 
-                lkv_k, lkv_v,
-                s_x, s_mem, 
-                temp_storage, shared_scalar,
-                seed_base, ns, step,
-                global_pop_offset,
-                scales
-            );
+                compute_transformer_layer(
+                    l, t, tid, model, 
+                    lkv_k, lkv_v,
+                    s_x, s_mem, 
+                    temp_storage, shared_scalar,
+                    seed_base, ns, step,
+                    global_pop_offset,
+                    scales
+                );
+            }
         }
 
         // 3. Final Head
@@ -347,19 +349,21 @@ __global__ void generate_sequence_kernel(
         compute_mlp(0, t, tid, s_x, s_mem, temp_storage, shared_scalar, model->ln_init, model->ln_init_bias, model->w_emb_mlp_up, model->mlp_emb_bias_up, model->w_emb_mlp_down, model->mlp_emb_bias_down, 0, 0, -1, 0, CFG_MLP_INIT);
 
         // 2. Layers
-        for (int l = 0; l < N_LAYERS; l++) {
-            ActType* lkv_base = kv_cache + (l * kv_layer_stride);
-            ActType* lkv_k = lkv_base;
-            ActType* lkv_v = lkv_base + total_len*HIDDEN_DIM;
+        for (int cycle = 0; cycle < NUMBER_OF_CYCLES; cycle++) {
+            for (int l = 0; l < N_LAYERS; l++) {
+                ActType* lkv_base = kv_cache + (l * kv_layer_stride);
+                ActType* lkv_k = lkv_base;
+                ActType* lkv_v = lkv_base + total_len*HIDDEN_DIM;
 
-            compute_transformer_layer(
-                l, t, tid, model, 
-                lkv_k, lkv_v,
-                s_x, s_mem, 
-                temp_storage, shared_scalar,
-                0, 0, -1, 
-                0
-            );
+                compute_transformer_layer(
+                    l, t, tid, model, 
+                    lkv_k, lkv_v,
+                    s_x, s_mem, 
+                    temp_storage, shared_scalar,
+                    0, 0, -1, 
+                    0
+                );
+            }
         }
 
         // Final Head

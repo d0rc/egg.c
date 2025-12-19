@@ -36,7 +36,7 @@ int main() {
     printf(BOLD CYAN "Configuration:\n" RESET);
     printf("  Hidden Dim: %d\n", HIDDEN_DIM);
     printf("  Heads:      %d (Head Dim: %d)\n", N_HEADS, HEAD_DIM);
-    printf("  Layers:     %d\n", N_LAYERS);
+    printf("  Layers:     %d (Cycles: %d, Total: %d)\n", N_LAYERS, NUMBER_OF_CYCLES, N_LAYERS * NUMBER_OF_CYCLES);
     printf("  Vocab Size: %d\n", VOCAB_SIZE);
     printf("  Seq Len:    %d\n", SEQ_LEN);
     printf("  NTT Mode:   %d\n", NTT_MODE);
@@ -88,7 +88,7 @@ int main() {
 
     // Layers
     printf("--------------------------------------------------------------------------------\n");
-    printf(BOLD BLUE "Transformer Layers (x%d)\n" RESET, N_LAYERS);
+    printf(BOLD BLUE "Transformer Layers (x%d, Cycles: %d)\n" RESET, N_LAYERS, NUMBER_OF_CYCLES);
     
     size_t layer_params = 0;
     
