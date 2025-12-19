@@ -299,7 +299,12 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 // Entropy H = log(sum_ex) - (sum_xe / sum_ex)
                 // Note: shifted = lgt - global_max, so sum_xe is relative to global_max.
                 // H = log(sum_ex) - (sum( (lgt-max) * exp(lgt-max) ) / sum_ex)
-                my_entropy += (log_sum >> 1) - (global_sum_xe / global_sum_ex);
+                
+                double z = (double)global_sum_ex;
+                double e_s = (double)global_sum_xe / z;
+                // H = log2(Z_real) - (log2(e)/scale) * E[shifted]
+                double h_val = (log2(z) - (double)SOFTMAX_SCALE_BIT) - (1.44269504 / SOFTMAX_EXP_SCALE) * e_s;
+                my_entropy += (long long)(h_val * 16.0);
             }
             my_loss += (log_sum >> 1) + global_max - s_target_logit;
         }

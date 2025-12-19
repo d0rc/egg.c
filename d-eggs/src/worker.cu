@@ -715,7 +715,7 @@ int main(int argc, char** argv) {
             
             // Send Result
             EggResultHeader res;
-            res.seed = current_seed;
+            res.seed = task_seed;
             res.last_step = current_step;
             res.data_position = resp.data_position;
             res.updates_count = last_updates_count;

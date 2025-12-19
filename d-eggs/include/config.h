@@ -3,7 +3,7 @@
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 256
+#  define HIDDEN_DIM 384
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64
@@ -15,7 +15,7 @@
 #  define NUMBER_OF_CYCLES 4
 #endif
 #ifndef SEQ_LEN
-#  define SEQ_LEN 64
+#  define SEQ_LEN 32
 #endif
 
 // NTT Mode: 0=disabled, 1=Walsh-Hadamard, 2=Fermat-257, 3=Fermat-65537
@@ -46,7 +46,7 @@
 #ifndef POPULATION_BATCH_SIZE
 #   define POPULATION_BATCH_SIZE (CHUNK_SIZE * 1)
 #endif
-#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 8)
+#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 12)
 
 #ifndef FIXED_POINT
 #  define FIXED_POINT 4
@@ -232,7 +232,7 @@
 #  define LOSS_HAXXING 1
 #endif
 #ifndef LOSS_HAXXING_RETRIES
-#  define LOSS_HAXXING_RETRIES 7
+#  define LOSS_HAXXING_RETRIES 3
 #endif
 // Direction: 'min', 'max', or 'mixed'
 #ifndef LOSS_HAXXING_DIRECTION
