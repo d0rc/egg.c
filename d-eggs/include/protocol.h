@@ -6,7 +6,7 @@
 #include <arpa/inet.h> // for htonl, ntohl
 
 #define EGG_PROTO_MAGIC 0x4A4F4253 // "JOBS"
-#define EGG_PROTO_VERSION 2
+#define EGG_PROTO_VERSION 3
 
 // Opcodes
 #define OP_JOB_REQUEST  0
@@ -128,13 +128,14 @@ static inline void egg_deserialize_job_response_header(const uint8_t *buf, EggJo
     memcpy(&res->learning_rate, &lr_int, 4);
 }
 
-// RESULT Header (44 bytes + result_data)
+// RESULT Header (52 bytes + result_data)
 typedef struct {
     uint64_t seed;
     uint64_t last_step;
     uint64_t data_position;
-    uint64_t updates_count; // Added field
-    uint64_t sum_loss;      // Added field (int64_t packed as uint64_t)
+    uint64_t updates_count;
+    uint64_t sum_loss;      // int64_t packed as uint64_t
+    uint64_t sum_entropy;   // Added field (int64_t packed as uint64_t)
     uint32_t result_size;
     // Followed by result_data
 } EggResultHeader;
@@ -145,29 +146,33 @@ static inline void egg_serialize_result_header(uint8_t *buf, const EggResultHead
     uint64_t d = htonll(res->data_position);
     uint64_t u = htonll(res->updates_count);
     uint64_t sl = htonll(res->sum_loss);
+    uint64_t se = htonll(res->sum_entropy);
     uint32_t r = htonl(res->result_size);
     memcpy(buf, &s, 8);
     memcpy(buf + 8, &l, 8);
     memcpy(buf + 16, &d, 8);
     memcpy(buf + 24, &u, 8);
     memcpy(buf + 32, &sl, 8);
-    memcpy(buf + 40, &r, 4);
+    memcpy(buf + 40, &se, 8);
+    memcpy(buf + 48, &r, 4);
 }
 
 static inline void egg_deserialize_result_header(const uint8_t *buf, EggResultHeader *res) {
-    uint64_t s, l, d, u, sl;
+    uint64_t s, l, d, u, sl, se;
     uint32_t r;
     memcpy(&s, buf, 8);
     memcpy(&l, buf + 8, 8);
     memcpy(&d, buf + 16, 8);
     memcpy(&u, buf + 24, 8);
     memcpy(&sl, buf + 32, 8);
-    memcpy(&r, buf + 40, 4);
+    memcpy(&se, buf + 40, 8);
+    memcpy(&r, buf + 48, 4);
     res->seed = ntohll(s);
     res->last_step = ntohll(l);
     res->data_position = ntohll(d);
     res->updates_count = ntohll(u);
     res->sum_loss = ntohll(sl);
+    res->sum_entropy = ntohll(se);
     res->result_size = ntohl(r);
 }
 

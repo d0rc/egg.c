@@ -91,7 +91,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     const TokenType * __restrict__ dataset, long data_len, int start_idx,
     const TransformerModel * __restrict__ model,
     ActType * __restrict__ global_kv_cache,
-    int32_t *accum_loss, uint32_t step_seed,
+    int32_t *accum_loss, int32_t *accum_entropy, uint32_t step_seed,
     int global_pop_offset, long step,
     const AdaptiveScales * __restrict__ scales = nullptr
 ) {
@@ -117,6 +117,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     size_t kv_ind_offset = (size_t)blockIdx.x * N_LAYERS * kv_layer_stride;
 
     long long my_loss = 0; // Loss accumulation needs high precision
+    long long my_entropy = 0;
 
 #if NTT_MODE != 0
     // Pre-compute NTT transform of sequence (once at start)
@@ -252,8 +253,9 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         __syncthreads();
         global_max = s_global_max;
 
-        // Pass 2: Sum Exp and Find Target Logit
+        // Pass 2: Sum Exp, Sum XE, and Find Target Logit
         int64_t local_sum_ex = 0;
+        int64_t local_sum_xe = 0;
         __shared__ int32_t s_target_logit;
         if (tid == 0) s_target_logit = 0;
         __syncthreads();
@@ -268,7 +270,9 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             int32_t lgt = ah >> SHIFT_LOGIT;
             
             int32_t shifted = lgt - global_max;
-            local_sum_ex += softmax_exp_lookup(shifted);
+            int32_t ex = softmax_exp_lookup(shifted);
+            local_sum_ex += ex;
+            local_sum_xe += (int64_t)shifted * ex;
             
             if (v == (int)target_token) s_target_logit = lgt;
         }
@@ -278,8 +282,9 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         typedef cub::BlockReduce<long long, EGG_BLOCK_THREADS> BlockReduce64;
         __shared__ typename BlockReduce64::TempStorage temp_storage64;
         long long global_sum_ex = BlockReduce64(temp_storage64).Sum(local_sum_ex);
+        long long global_sum_xe = BlockReduce64(temp_storage64).Sum(local_sum_xe);
 
-        // Loss Calc (Thread 0)
+        // Loss & Entropy Calc (Thread 0)
         if (tid == 0) {
             int64_t log_sum = 0;
             if (global_sum_ex > 0) {
@@ -290,13 +295,21 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 if(x >= 2) { pos += 1; }
                 
                 log_sum = (pos << 4) - (SOFTMAX_SCALE_BIT << 4);
+                
+                // Entropy H = log(sum_ex) - (sum_xe / sum_ex)
+                // Note: shifted = lgt - global_max, so sum_xe is relative to global_max.
+                // H = log(sum_ex) - (sum( (lgt-max) * exp(lgt-max) ) / sum_ex)
+                my_entropy += (log_sum >> 1) - (global_sum_xe / global_sum_ex);
             }
             my_loss += (log_sum >> 1) + global_max - s_target_logit;
         }
         __syncthreads(); 
     }
 
-    if (tid == 0) accum_loss[blockIdx.x] = (int32_t)my_loss; // Store at block index (relative to chunk)
+    if (tid == 0) {
+        accum_loss[blockIdx.x] = (int32_t)my_loss;
+        accum_entropy[blockIdx.x] = (int32_t)my_entropy;
+    }
 }
 
 __global__ void compute_fitness_kernel(const int32_t *accum_loss, int32_t *fitnesses, int count) {

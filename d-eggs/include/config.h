@@ -9,7 +9,7 @@
 #  define HEAD_DIM 64
 #endif
 #ifndef N_LAYERS
-#  define N_LAYERS 6
+#  define N_LAYERS 4
 #endif
 #ifndef NUMBER_OF_CYCLES
 #  define NUMBER_OF_CYCLES 4
@@ -232,11 +232,11 @@
 #  define LOSS_HAXXING 1
 #endif
 #ifndef LOSS_HAXXING_RETRIES
-#  define LOSS_HAXXING_RETRIES 5
+#  define LOSS_HAXXING_RETRIES 7
 #endif
 // Direction: 'min', 'max', or 'mixed'
 #ifndef LOSS_HAXXING_DIRECTION
-#  define LOSS_HAXXING_DIRECTION 'max'
+#  define LOSS_HAXXING_DIRECTION 'entmax'
 #endif
 // Ratio of 'min' chunks when direction='mixed' (0.0 to 1.0, default 0.5 = 50/50)
 #ifndef LOSS_HAXXING_MIXED_RATIO

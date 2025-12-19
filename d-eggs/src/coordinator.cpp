@@ -38,8 +38,16 @@ inline bool is_min_mode_for_step([[maybe_unused]] uint64_t step) {
 #endif
 }
 
-inline uint64_t get_initial_best_loss_for_step(uint64_t step) {
+inline uint64_t get_initial_best_metric(uint64_t step) {
+#if LOSS_HAXXING_DIRECTION == 'entmax'
+    return 0; // Maximize entropy
+#elif LOSS_HAXXING_DIRECTION == 'min'
+    return UINT64_MAX;
+#elif LOSS_HAXXING_DIRECTION == 'mixed'
     return is_min_mode_for_step(step) ? UINT64_MAX : 0;
+#else // 'max'
+    return 0;
+#endif
 }
 
 // Constants
@@ -71,11 +79,15 @@ struct GlobalState {
     // Current Step State
     std::vector<int32_t> current_fitness; // Size: POPULATION_SIZE / 2
     int64_t step_sum_loss = 0;            // Aggregated loss for current step
+    int64_t step_sum_entropy = 0;         // Aggregated entropy for current step
     std::vector<bool> chunk_completed;    // Size: POPULATION_SIZE / CHUNK_SIZE
     std::vector<bool> chunk_in_progress;  // Size: POPULATION_SIZE / CHUNK_SIZE
     std::vector<int> chunk_attempts;      // Number of successful attempts per chunk
     std::vector<uint32_t> chunk_shifts;   // Shift used for the best result of each chunk
-    std::vector<uint64_t> chunk_best_loss;// Best loss seen for each chunk
+    std::vector<uint64_t> chunk_best_loss;// Loss of the selected attempt
+    std::vector<uint64_t> chunk_best_metric;// Best metric value (loss or entropy) seen for each chunk
+    std::vector<uint64_t> chunk_min_entropy; // Min entropy seen for each chunk
+    std::vector<uint64_t> chunk_max_entropy; // Max entropy seen for each chunk
     std::vector<std::chrono::steady_clock::time_point> chunk_assign_time; // When each chunk was last assigned
     std::deque<int> chunk_queue;          // Queue of chunks to assign
     int chunks_remaining = 0;
@@ -297,7 +309,7 @@ void handle_client(int sock) {
             
         } else if (opcode == OP_RESULT) {
             EggResultHeader res;
-            if (payload_len < 44) break;  // Updated from 36 to 44
+            if (payload_len < 52) break;
             egg_deserialize_result_header(payload.data(), &res);
             
             int chunk_idx = res.data_position / CHUNK_SIZE;
@@ -305,7 +317,7 @@ void handle_client(int sock) {
             // Unpack fitness
             int num_fitness = CHUNK_SIZE / 2;
             std::vector<int32_t> h_fit(num_fitness);
-            ternary_unpack(payload.data() + 44, num_fitness, h_fit.data());
+            ternary_unpack(payload.data() + 52, num_fitness, h_fit.data());
             
             std::lock_guard<std::mutex> lock(g_state.mutex);
             
@@ -324,12 +336,34 @@ void handle_client(int sock) {
                     // (before incrementing, since that's what was sent during assignment)
                     uint32_t used_shift = g_state.chunk_attempts[chunk_idx];
                     g_state.chunk_attempts[chunk_idx]++;
+
+                    if (res.sum_entropy < g_state.chunk_min_entropy[chunk_idx]) g_state.chunk_min_entropy[chunk_idx] = res.sum_entropy;
+                    if (res.sum_entropy > g_state.chunk_max_entropy[chunk_idx]) g_state.chunk_max_entropy[chunk_idx] = res.sum_entropy;
                     
                     bool is_best = false;
+                    uint64_t current_metric;
+#if LOSS_HAXXING_DIRECTION == 'entmax'
+                    current_metric = res.sum_entropy;
+#else
+                    current_metric = res.sum_loss;
+#endif
+
+                    bool better = false;
+#if LOSS_HAXXING_DIRECTION == 'entmax'
+                    if (current_metric > g_state.chunk_best_metric[chunk_idx]) better = true;
+#elif LOSS_HAXXING_DIRECTION == 'min'
+                    if (current_metric < g_state.chunk_best_metric[chunk_idx]) better = true;
+#elif LOSS_HAXXING_DIRECTION == 'mixed'
                     bool use_min = is_min_mode_for_step(g_state.current_step);
-                    if ((use_min && res.sum_loss < g_state.chunk_best_loss[chunk_idx]) ||
-                        (!use_min && res.sum_loss > g_state.chunk_best_loss[chunk_idx])) {
-                        g_state.chunk_best_loss[chunk_idx] = res.sum_loss;
+                    if (use_min && current_metric < g_state.chunk_best_metric[chunk_idx]) better = true;
+                    if (!use_min && current_metric > g_state.chunk_best_metric[chunk_idx]) better = true;
+#else // max
+                    if (current_metric > g_state.chunk_best_metric[chunk_idx]) better = true;
+#endif
+
+                    if (better) {
+                        g_state.chunk_best_metric[chunk_idx] = current_metric;
+                        g_state.chunk_best_loss[chunk_idx] = res.sum_loss; // Always track loss for accumulation
                         // Store the shift that produced this best result
                         g_state.chunk_shifts[chunk_idx] = used_shift;
                         is_best = true;
@@ -344,9 +378,20 @@ void handle_client(int sock) {
                     }
 
                     if (LOSS_HAXXING) {
-                        printf("[Haxxing] Chunk %d Attempt %d/%d | Loss: %" PRIu64 " | Best: %" PRIu64 "%s\n", 
+#if LOSS_HAXXING_DIRECTION == 'entmax'
+                        printf("[Haxxing] Chunk %d Attempt %d/%d | Loss: %" PRIu64 " | Ent: %" PRIu64 " (Min: %" PRIu64 ", Max: %" PRIu64 ") | Selected Loss: %" PRIu64 "%s\n", 
                                chunk_idx, g_state.chunk_attempts[chunk_idx], LOSS_HAXXING_RETRIES, 
-                               res.sum_loss, g_state.chunk_best_loss[chunk_idx], is_best ? " *" : "");
+                               res.sum_loss, 
+                               res.sum_entropy, g_state.chunk_min_entropy[chunk_idx], g_state.chunk_max_entropy[chunk_idx],
+                               g_state.chunk_best_loss[chunk_idx],
+                               is_best ? " *" : "");
+#else
+                        printf("[Haxxing] Chunk %d Attempt %d/%d | Loss: %" PRIu64 " | Best Loss: %" PRIu64 " | Ent: %" PRIu64 " (Min: %" PRIu64 ", Max: %" PRIu64 ")%s\n", 
+                               chunk_idx, g_state.chunk_attempts[chunk_idx], LOSS_HAXXING_RETRIES, 
+                               res.sum_loss, g_state.chunk_best_loss[chunk_idx], 
+                               res.sum_entropy, g_state.chunk_min_entropy[chunk_idx], g_state.chunk_max_entropy[chunk_idx],
+                               is_best ? " *" : "");
+#endif
                     }
 
                     if (g_state.chunk_attempts[chunk_idx] < LOSS_HAXXING_RETRIES) {
@@ -357,8 +402,9 @@ void handle_client(int sock) {
                         g_state.chunk_completed[chunk_idx] = true;
                         g_state.chunks_remaining--;
                         
-                        // Accumulate Loss (Use the BEST loss)
+                        // Accumulate Loss & Entropy (Use the BEST loss)
                         g_state.step_sum_loss += g_state.chunk_best_loss[chunk_idx];
+                        g_state.step_sum_entropy += res.sum_entropy; // Entropy is just for logging
                         
                         if (LOSS_HAXXING) {
                             printf("[Haxxing] Chunk %d Finalized. Selected Loss: %" PRIu64 "\n", 
@@ -367,8 +413,9 @@ void handle_client(int sock) {
                     
                         if (g_state.chunks_remaining == 0) {
                         // Step Complete
-                        // Calculate Avg Loss
+                        // Calculate Avg Loss & Entropy
                         double avg_loss = (double)g_state.step_sum_loss / (POPULATION_SIZE * SEQ_LEN * 16.0);
+                        double avg_entropy = (double)g_state.step_sum_entropy / (POPULATION_SIZE * SEQ_LEN * 16.0);
                         
                         // Calculate Time and Speed
                         auto now = std::chrono::steady_clock::now();
@@ -411,10 +458,11 @@ void handle_client(int sock) {
                         uint64_t total_tokens = g_state.current_step * POPULATION_SIZE * SEQ_LEN;
 
                         // Print Log
-                        printf("Step %" PRIu64 " | Tokens: %s | Loss: %s%.4f%s | Time: %.2f ms | Updates: %" PRIu64 " %s | Speed: %.2f tok/s | LR: %.6f | Net: %.2f MB/s (Tx: %s, Rx: %s)\n", 
+                        printf("Step %" PRIu64 " | Tokens: %s | Loss: %s%.4f%s | Entropy: %.4f | Time: %.2f ms | Updates: %" PRIu64 " %s | Speed: %.2f tok/s | LR: %.6f | Net: %.2f MB/s (Tx: %s, Rx: %s)\n", 
                                g_state.current_step, 
                                humanize_tokens(total_tokens).c_str(),
                                loss_color, avg_loss, reset_color,
+                               avg_entropy,
                                step_ms, g_state.step_total_updates, updates_detail,
                                tokens_per_sec, current_lr, net_mbps,
                                humanize_bytes(sent).c_str(), humanize_bytes(recv).c_str());
@@ -458,14 +506,18 @@ void handle_client(int sock) {
                         g_state.chunk_attempts.assign(total_chunks, 0);
                         g_state.chunk_shifts.assign(total_chunks, 0);
                         // All chunks in same step use same initial value based on step mode
-                        uint64_t init_loss = get_initial_best_loss_for_step(g_state.current_step);
-                        g_state.chunk_best_loss.assign(total_chunks, init_loss);
+                        uint64_t init_metric = get_initial_best_metric(g_state.current_step);
+                        g_state.chunk_best_metric.assign(total_chunks, init_metric);
+                        g_state.chunk_best_loss.assign(total_chunks, 0);
+                        g_state.chunk_min_entropy.assign(total_chunks, UINT64_MAX);
+                        g_state.chunk_max_entropy.assign(total_chunks, 0);
                         g_state.chunks_remaining = total_chunks;
                         g_state.chunk_queue.clear();
                         for(int i=0; i<total_chunks; i++) g_state.chunk_queue.push_back(i);
                         
                         std::fill(g_state.current_fitness.begin(), g_state.current_fitness.end(), 0);
                         g_state.step_sum_loss = 0;
+                        g_state.step_sum_entropy = 0;
                         g_state.step_total_updates = 0;  // Reset updates counter
                         g_state.step_min_updates = UINT64_MAX;
                         g_state.step_max_updates = 0;
@@ -514,8 +566,11 @@ int main(int argc, char** argv) {
     g_state.chunk_attempts.resize(total_chunks, 0);
     g_state.chunk_shifts.resize(total_chunks, 0);
     // All chunks in same step use same initial value based on step mode
-    uint64_t init_loss = get_initial_best_loss_for_step(g_state.current_step);
-    g_state.chunk_best_loss.assign(total_chunks, init_loss);
+    uint64_t init_metric = get_initial_best_metric(g_state.current_step);
+    g_state.chunk_best_metric.assign(total_chunks, init_metric);
+    g_state.chunk_best_loss.assign(total_chunks, 0);
+    g_state.chunk_min_entropy.assign(total_chunks, UINT64_MAX);
+    g_state.chunk_max_entropy.assign(total_chunks, 0);
     g_state.chunk_assign_time.resize(total_chunks);
     g_state.chunks_remaining = total_chunks;
     for(int i=0; i<total_chunks; i++) g_state.chunk_queue.push_back(i);

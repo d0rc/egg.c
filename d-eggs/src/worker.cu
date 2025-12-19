@@ -325,6 +325,7 @@ int main(int argc, char** argv) {
     
     // Buffers
     int32_t *d_loss; allocate_managed((void**)&d_loss, POPULATION_SIZE * sizeof(int32_t), device_id); // Max size
+    int32_t *d_entropy; allocate_managed((void**)&d_entropy, POPULATION_SIZE * sizeof(int32_t), device_id);
     int32_t *d_fit; allocate_managed((void**)&d_fit, (POPULATION_SIZE/2) * sizeof(int32_t), device_id);
     uint32_t *d_chunk_shifts; allocate_managed((void**)&d_chunk_shifts, (POPULATION_SIZE/CHUNK_SIZE) * sizeof(uint32_t), device_id);
 
@@ -642,24 +643,28 @@ int main(int argc, char** argv) {
             
             train_sequence_kernel<<<count, EGG_BLOCK_THREADS, sm_size>>>(
                 d_dataset, ds_len, current_step*SEQ_LEN, d_model, d_kv_cache, 
-                d_loss, task_seed, global_pop_offset, current_step, d_scales
+                d_loss, d_entropy, task_seed, global_pop_offset, current_step, d_scales
             );
             
             // Copy Result
             std::vector<int32_t> h_loss(count);
+            std::vector<int32_t> h_entropy(count);
             cudaMemcpy(h_loss.data(), d_loss, count * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_entropy.data(), d_entropy, count * sizeof(int32_t), cudaMemcpyDeviceToHost);
             
-            // Compute Fitness & Sum Loss
+            // Compute Fitness, Sum Loss & Sum Entropy
             int64_t sum_loss = 0;
+            int64_t sum_entropy = 0;
             int num_fitness = count / 2;
             std::vector<int32_t> diffs(num_fitness);
             
-            // First pass: compute diffs and sum_loss
+            // First pass: compute diffs, sum_loss and sum_entropy
             double sum_diff_val = 0.0;
             for(int i=0; i<num_fitness; i++) {
                 int32_t p = h_loss[2*i];
                 int32_t n = h_loss[2*i+1];
                 sum_loss += p + n;
+                sum_entropy += h_entropy[2*i] + h_entropy[2*i+1];
                 diffs[i] = n - p; // Positive if p < n (p is better -> +1)
                 sum_diff_val += diffs[i];
             }
@@ -715,18 +720,19 @@ int main(int argc, char** argv) {
             res.data_position = resp.data_position;
             res.updates_count = last_updates_count;
             res.sum_loss = sum_loss;
+            res.sum_entropy = sum_entropy;
             res.result_size = packed_size;
             
             last_updates_count = 0; // Reset so we don't double count if we process multiple chunks
             
-            uint8_t res_buf[44];
+            uint8_t res_buf[52];
             egg_serialize_result_header(res_buf, &res);
             
             uint8_t packet_header[EGG_HEADER_SIZE];
-            egg_write_header(packet_header, OP_RESULT, 44 + res.result_size);
+            egg_write_header(packet_header, OP_RESULT, 52 + res.result_size);
             
             send(sock, packet_header, EGG_HEADER_SIZE, 0);
-            send(sock, res_buf, 44, 0);
+            send(sock, res_buf, 52, 0);
             send(sock, packed_fit.data(), res.result_size, 0);
             
             // std::cout << "Computed Chunk " << chunk_idx << " for Step " << current_step << std::endl;
