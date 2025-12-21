@@ -91,7 +91,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     const TokenType * __restrict__ dataset, long data_len, int start_idx,
     const TransformerModel * __restrict__ model,
     ActType * __restrict__ global_kv_cache,
-    int32_t *accum_loss, int32_t *accum_entropy, uint32_t step_seed,
+    long long *accum_loss, long long *accum_entropy, uint32_t step_seed,
     int global_pop_offset, long step,
     const AdaptiveScales * __restrict__ scales = nullptr
 ) {
@@ -242,7 +242,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             if (scales) s_head_out = get_adaptive_factor(scales->embedding_row[v], step_seed + pair_idx + SEED_OFF_EMB, v);
             
             AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns, s_head_out);
-            int32_t lgt = ah >> SHIFT_LOGIT;
+            int32_t lgt = ah;
             if (lgt > local_max) local_max = lgt;
         }
         
@@ -267,7 +267,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             if (scales) s_head_out = get_adaptive_factor(scales->embedding_row[v], step_seed + pair_idx + SEED_OFF_EMB, v);
 
             AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns, s_head_out);
-            int32_t lgt = ah >> SHIFT_LOGIT;
+            int32_t lgt = ah;
             
             int32_t shifted = lgt - global_max;
             int32_t ex = softmax_exp_lookup(shifted);
@@ -286,16 +286,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
         // Loss & Entropy Calc (Thread 0)
         if (tid == 0) {
-            int64_t log_sum = 0;
             if (global_sum_ex > 0) {
-                uint64_t x = (uint64_t)global_sum_ex; int pos = 0;
-                while(x >= 256) { x >>= 8; pos += 8; }
-                if(x >= 16) { x >>= 4; pos += 4; }
-                if(x >= 4) { x >>= 2; pos += 2; }
-                if(x >= 2) { pos += 1; }
-                
-                log_sum = (pos << 4) - (SOFTMAX_SCALE_BIT << 4);
-                
                 // Entropy H = log(sum_ex) - (sum_xe / sum_ex)
                 // Note: shifted = lgt - global_max, so sum_xe is relative to global_max.
                 // H = log(sum_ex) - (sum( (lgt-max) * exp(lgt-max) ) / sum_ex)
@@ -304,23 +295,29 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 double e_s = (double)global_sum_xe / z;
                 // H = log2(Z_real) - (log2(e)/scale) * E[shifted]
                 double h_val = (log2(z) - (double)SOFTMAX_SCALE_BIT) - (1.44269504 / SOFTMAX_EXP_SCALE) * e_s;
-                my_entropy += (long long)(h_val * 16.0);
+                my_entropy += (long long)(h_val * (double)(1 << FIXED_POINT));
+
+                // FP32 Loss Calculation
+                double log_term = SOFTMAX_EXP_SCALE * (log(z) - (double)SOFTMAX_SCALE_BIT * EGG_LN2);
+                // log_term is already Scale 256 (from SOFTMAX_EXP_SCALE)
+                my_loss += (long long)(log_term + (double)global_max - (double)s_target_logit);
+            } else {
+                my_loss += (long long)(global_max - s_target_logit);
             }
-            my_loss += (log_sum >> 1) + global_max - s_target_logit;
         }
         __syncthreads(); 
     }
 
     if (tid == 0) {
-        accum_loss[blockIdx.x] = (int32_t)my_loss;
-        accum_entropy[blockIdx.x] = (int32_t)my_entropy;
+        accum_loss[blockIdx.x] = my_loss;
+        accum_entropy[blockIdx.x] = my_entropy;
     }
 }
 
-__global__ void compute_fitness_kernel(const int32_t *accum_loss, int32_t *fitnesses, int count) {
+__global__ void compute_fitness_kernel(const long long *accum_loss, int32_t *fitnesses, int count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
-    int32_t p = accum_loss[2*idx]; int32_t n = accum_loss[2*idx+1];
+    long long p = accum_loss[2*idx]; long long n = accum_loss[2*idx+1];
     fitnesses[idx] = (p < n) ? 1 : ((n < p) ? -1 : 0);
 }
 
@@ -406,7 +403,7 @@ __global__ void generate_sequence_kernel(
         
         for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
             AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
-            int32_t lgt = ah >> SHIFT_LOGIT;
+            int32_t lgt = ah;
             
             // Presence Penalty
             for (int i = 0; i <= t; i++) {
@@ -428,7 +425,7 @@ __global__ void generate_sequence_kernel(
         int64_t local_sum_ex = 0;
         for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
             AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
-            int32_t lgt = ah >> SHIFT_LOGIT;
+            int32_t lgt = ah;
             
             // Presence Penalty
             for (int i = 0; i <= t; i++) {
@@ -472,7 +469,7 @@ __global__ void generate_sequence_kernel(
             long long running = thread_prefix_sum;
             for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
                 AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
-                int32_t lgt = ah >> SHIFT_LOGIT;
+                int32_t lgt = ah;
                 
                 // Presence Penalty
                 for (int i = 0; i <= t; i++) {

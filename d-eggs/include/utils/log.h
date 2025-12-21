@@ -8,7 +8,7 @@
 #include <string.h>
 
 #define EGG_API_BASE "https://jlbhiestcyjduotrkmwl.supabase.co/functions/v1"
-#define EGG_PROJECT_ID "350e7662-d474-4e8a-946d-517fca656005"
+#define EGG_PROJECT_ID "285d5206-e580-4aea-8b11-b3ad1afc2f1f"
 
 // Experiment name - can be overridden via -DEXPERIMENT_NAME=\"my_experiment\"
 #ifndef EXPERIMENT_NAME

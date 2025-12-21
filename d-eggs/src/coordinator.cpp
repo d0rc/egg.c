@@ -22,6 +22,7 @@
 #include "utils/ternary_pack.h"
 #include "utils/checkpoint.h"
 #include "utils/terminal.h"
+#include "utils/loss_formatter.h"
 
 // Loss Haxxing - Direction selection helpers
 // Determines whether to use 'min' or 'max' selection for each step
@@ -100,6 +101,7 @@ struct GlobalState {
     std::vector<int32_t> current_fitness; // Size: POPULATION_SIZE / 2
     int64_t step_sum_loss = 0;            // Aggregated loss for current step
     int64_t step_sum_entropy = 0;         // Aggregated entropy for current step
+    int consecutive_zero_loss_steps = 0;  // Track consecutive steps with 0 loss
     
     std::vector<bool> chunk_completed;    // Size: POPULATION_SIZE / CHUNK_SIZE
     
@@ -196,6 +198,24 @@ bool recv_exact(int sock, void* buf, uint32_t len) {
     }
     g_bytes_received += len;
     return true;
+}
+
+void check_termination_conditions() {
+    // 1. Max Steps Check
+#ifdef MAX_STEPS
+    if (g_state.current_step >= MAX_STEPS) {
+        printf("Reached maximum steps (%d). Exiting.\n", MAX_STEPS);
+        egg_log_close(&g_log_state);
+        exit(0);
+    }
+#endif
+
+    // 2. Zero Loss Check
+    if (g_state.consecutive_zero_loss_steps > 10) {
+        printf("Early termination: Loss has been 0 for %d consecutive steps.\n", g_state.consecutive_zero_loss_steps);
+        egg_log_close(&g_log_state);
+        exit(0);
+    }
 }
 
 void finalize_step() {
@@ -297,8 +317,17 @@ void finalize_step() {
            selected_min_loss, selected_max_loss, selected_min_entropy, selected_max_entropy);
 
     // Calculate Avg Loss & Entropy
-    double avg_loss = (double)g_state.step_sum_loss / (POPULATION_SIZE * SEQ_LEN * 16.0);
-    double avg_entropy = (double)g_state.step_sum_entropy / (POPULATION_SIZE * SEQ_LEN * 16.0);
+    double loss_scale = SOFTMAX_EXP_SCALE / (double)(1 << FIXED_POINT);
+    double entropy_scale = (double)(1 << FIXED_POINT);
+    double avg_loss = (double)g_state.step_sum_loss / (POPULATION_SIZE * SEQ_LEN * loss_scale);
+    double avg_entropy = (double)g_state.step_sum_entropy / (POPULATION_SIZE * SEQ_LEN * entropy_scale);
+
+    // Update Zero Loss Counter
+    if (g_state.step_sum_loss == 0) {
+        g_state.consecutive_zero_loss_steps++;
+    } else {
+        g_state.consecutive_zero_loss_steps = 0;
+    }
     
     // Calculate Time and Speed
     auto now = std::chrono::steady_clock::now();
@@ -349,13 +378,15 @@ void finalize_step() {
            step_ms, g_state.step_total_updates, updates_detail,
            tokens_per_sec, current_lr, net_mbps,
            humanize_bytes(sent).c_str(), humanize_bytes(recv).c_str());
+    
+    std::cout << egg::utils::format_loss_info(avg_loss) << std::endl;
 
     // Update previous values
     g_state.prev_loss = avg_loss;
     g_state.prev_max_updates = g_state.step_max_updates;
 
     // Remote logging
-    egg_log_record(&g_log_state, g_state.current_step, avg_loss, 
+    egg_log_record(&g_log_state, g_state.current_step, egg::utils::loss_to_bits(egg::utils::loss_to_nats(avg_loss)), 
                    g_state.step_total_updates, current_lr);
 
     // Store history (packed)
@@ -378,6 +409,8 @@ void finalize_step() {
     // Advance
     g_state.current_step++;
     g_state.current_seed = hash_rng(g_state.current_seed, g_state.current_step); // Simple evolution
+
+    check_termination_conditions();
 
     // Save Checkpoint (with scheduler)
     trigger_save_checkpoint(g_save_dir, g_state.current_step, g_state.current_seed, packed_fit, g_scheduler);
@@ -650,7 +683,11 @@ int main(int argc, char** argv) {
     signal(SIGTERM, signal_handler);
     
     // Init Scheduler
-    g_scheduler = init_scheduler_default(0.5);
+#ifdef LEARNING_RATE
+    g_scheduler = init_scheduler_default(LEARNING_RATE);
+#else
+    g_scheduler = init_scheduler_default(0.5f);
+#endif
     g_state.current_lr = g_scheduler.current_lr;
     
     // Init State

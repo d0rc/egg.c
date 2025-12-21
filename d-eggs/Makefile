@@ -1,7 +1,7 @@
 NVCC = nvcc
 CXX = g++
-CFLAGS = -O3 -Iinclude
-NVCCFLAGS = -O3 -Iinclude -arch=sm_86 -lcublas -rdc=true
+CFLAGS = -O3 -Iinclude $(EXTRA_FLAGS)
+NVCCFLAGS = -O3 -Iinclude -arch=sm_86 -lcublas -rdc=true $(EXTRA_FLAGS)
 
 all: coordinator worker print_arch
 

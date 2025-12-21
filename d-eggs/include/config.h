@@ -3,7 +3,7 @@
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 384
+#  define HIDDEN_DIM 256
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64
@@ -12,7 +12,7 @@
 #  define N_LAYERS 4
 #endif
 #ifndef NUMBER_OF_CYCLES
-#  define NUMBER_OF_CYCLES 4
+#  define NUMBER_OF_CYCLES 1
 #endif
 #ifndef SEQ_LEN
 #  define SEQ_LEN 32
@@ -65,10 +65,10 @@
 #endif
 #define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)
 #ifndef SOFTMAX_LUT_SIZE
-#  define SOFTMAX_LUT_SIZE 256
+#  define SOFTMAX_LUT_SIZE 4096
 #endif
 #ifndef SOFTMAX_EXP_SCALE
-#  define SOFTMAX_EXP_SCALE 6.0
+#  define SOFTMAX_EXP_SCALE 256.0
 #endif
 
 // RoPE Configuration
@@ -229,18 +229,22 @@
 
 // Loss Haxxing (Retry chunks and pick best)
 #ifndef LOSS_HAXXING
-#  define LOSS_HAXXING 1
+#  define LOSS_HAXXING 0
 #endif
 #ifndef LOSS_HAXXING_RETRIES
-#  define LOSS_HAXXING_RETRIES 3
+#  define LOSS_HAXXING_RETRIES 1
 #endif
-// Direction: 'min', 'max', or 'mixed'
+// Direction: 'min', 'max', or 'mixed', or `entmax`
 #ifndef LOSS_HAXXING_DIRECTION
-#  define LOSS_HAXXING_DIRECTION 'entmax'
+#  define LOSS_HAXXING_DIRECTION 'min'
 #endif
 // Ratio of 'min' chunks when direction='mixed' (0.0 to 1.0, default 0.5 = 50/50)
 #ifndef LOSS_HAXXING_MIXED_RATIO
 #  define LOSS_HAXXING_MIXED_RATIO 0.2f
+#endif
+
+#ifndef ENTMAX_IGNORE_ZERO_ENT_DATA
+#  define ENTMAX_IGNORE_ZERO_ENT_DATA 1
 #endif
 
 // Adaptive Noise (Noise-Trained Layer)
@@ -258,6 +262,10 @@
 #endif
 #ifndef ADAPTIVE_NOISE_INIT
 #  define ADAPTIVE_NOISE_INIT 64
+#endif
+
+#ifndef EGG_LN2
+#  define EGG_LN2 0.69314718056
 #endif
 
 #endif // EGG_CONFIG_H

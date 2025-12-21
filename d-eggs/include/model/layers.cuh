@@ -70,7 +70,7 @@ __device__ __forceinline__ int simd_dp4a(int a, int b, int c) {
 
 __device__ __forceinline__ int32_t softmax_exp_lookup(int32_t diff) {
     int index = -diff;  // diff is negative or zero, so index is positive
-    index = (index < 0) ? 0 : ((index > 255) ? 255 : index);
+    index = (index < 0) ? 0 : ((index > (SOFTMAX_LUT_SIZE - 1)) ? (SOFTMAX_LUT_SIZE - 1) : index);
     return d_EXP_LUT[index];
 }
 

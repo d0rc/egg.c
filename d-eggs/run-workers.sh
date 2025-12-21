@@ -1,5 +1,10 @@
 #!/bin/bash
 
+if [ -f "hold.flag" ]; then
+    sleep 1
+    exit 0
+fi
+
 # Detect available NVIDIA GPUs
 GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
 
