@@ -12,7 +12,7 @@
 #  define N_LAYERS 4
 #endif
 #ifndef NUMBER_OF_CYCLES
-#  define NUMBER_OF_CYCLES 1
+#  define NUMBER_OF_CYCLES 4
 #endif
 #ifndef SEQ_LEN
 #  define SEQ_LEN 32
@@ -41,7 +41,7 @@
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 #ifndef CHUNK_SIZE
-#   define CHUNK_SIZE (8192)
+#   define CHUNK_SIZE (8192*4)
 #endif
 #ifndef POPULATION_BATCH_SIZE
 #   define POPULATION_BATCH_SIZE (CHUNK_SIZE * 1)
@@ -52,23 +52,23 @@
 #  define FIXED_POINT 4
 #endif
 #ifndef SIGMA_SHIFT
-#  define SIGMA_SHIFT 3
+#  define SIGMA_SHIFT 4
 #endif
 #ifndef SIGMA_SHIFT_VECTOR
-#  define SIGMA_SHIFT_VECTOR 4
+#  define SIGMA_SHIFT_VECTOR 5
 #endif
 #define MAX_VAL 127
 #define MIN_VAL -127
 
 #ifndef SOFTMAX_SCALE_BIT
-#  define SOFTMAX_SCALE_BIT 18
+#  define SOFTMAX_SCALE_BIT 20
 #endif
 #define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)
 #ifndef SOFTMAX_LUT_SIZE
 #  define SOFTMAX_LUT_SIZE 4096
 #endif
 #ifndef SOFTMAX_EXP_SCALE
-#  define SOFTMAX_EXP_SCALE 256.0
+#  define SOFTMAX_EXP_SCALE 128.0
 #endif
 
 // RoPE Configuration

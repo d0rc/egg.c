@@ -234,6 +234,8 @@ void network_thread_func(std::string server_ip, int port) {
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         perror("Connection Failed");
         g_running = false;
+        job_queue.cancel();
+        result_queue.cancel();
         return;
     }
     std::cout << "Connected to " << server_ip << " (Network Thread)" << std::endl;

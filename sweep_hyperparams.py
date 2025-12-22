@@ -9,22 +9,22 @@ import random
 # Define your search space here.
 # Keys must match the macro names in config.h (or LEARNING_RATE/MAX_STEPS).
 SEARCH_SPACE = {
-    "LEARNING_RATE": [0.5],
-    "NUMBER_OF_CYCLES": [1, 2],
-    "SOFTMAX_EXP_SCALE": [32.0],
-    "SOFTMAX_LUT_SIZE": [1024, 2048],
-    "SOFTMAX_SCALE_BIT": [18, 20],
-    "SIGMA_SHIFT": [3, 4],
-    "SIGMA_SHIFT_VECTOR": [4, 5],
+    "LEARNING_RATE": [0.1, 0.5],
+    "NUMBER_OF_CYCLES": [1, 2, 4],
+    "SOFTMAX_EXP_SCALE": [8.0, 16.0, 32.0, 64.0, 128.0, 256.0],
+    "SOFTMAX_LUT_SIZE": [512, 1024, 2048, 4096, 8192],
+    "SOFTMAX_SCALE_BIT": [16, 18, 20, 22],
+    "SIGMA_SHIFT": [3, 4, 5],
+    "SIGMA_SHIFT_VECTOR": [3, 4, 5],
     "ADAM_BETA1": [0.95],
     "ADAM_BETA2": [0.95, 0.99],
     "ADAM_EPS": [1e-8],
-    "ADAM_WEIGHT_DECAY": [0.2, 0.3],
+    "ADAM_WEIGHT_DECAY": [0.2, 0.3, 0.4],
     "ROPE_SCALE_BIT": [14, 16, 20, 24],
     "NTT_MODE": [0],
-    "CHUNK_MEAN_FILTER": [0, 1],
+    "CHUNK_MEAN_FILTER": [1],
     "CHUNK_MEAN_EXPONENT": [2.0],
-    "USE_ADAPTIVE_THRESHOLD": [0, 1],
+    "USE_ADAPTIVE_THRESHOLD": [1],
 }
 
 # Fixed parameters for all runs
@@ -65,17 +65,34 @@ def sanitize_value(val):
     return str(val)
 
 def main():
+    # Parse arguments for distributed sweeping
+    node_id = 1
+    total_nodes = 1
+    if len(sys.argv) >= 3:
+        try:
+            node_id = int(sys.argv[1])
+            total_nodes = int(sys.argv[2])
+            print(f"Running as Node {node_id} of {total_nodes}")
+        except ValueError:
+            print("Usage: python3 sweep_hyperparams.py [node_id] [total_nodes]")
+            sys.exit(1)
+
     # Generate all combinations
     keys = list(SEARCH_SPACE.keys())
     values = list(SEARCH_SPACE.values())
     combinations = list(itertools.product(*values))
     
+    # Fix seed for deterministic shuffling across nodes
+    random.seed(42)
     random.shuffle(combinations)
 
     print(f"Found {len(combinations)} configurations to sweep.")
     
     for i, combo in enumerate(combinations):
-        
+        # Distributed check
+        if i % total_nodes != (node_id - 1):
+            continue
+
         # Build configuration dictionary
         config = dict(zip(keys, combo))
         config.update(FIXED_PARAMS)

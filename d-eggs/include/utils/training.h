@@ -52,7 +52,7 @@ inline ReduceLROnPlateau init_scheduler(double base_lr, double factor, int patie
 inline ReduceLROnPlateau init_scheduler_default(double base_lr) {
     return init_scheduler(
         base_lr,     // base_lr
-        0.90,         // factor (aggressive decay)
+        0.99,         // factor (aggressive decay)
         30,         // patience (steps)
         5e-3,        // min_lr
         1e-2,        // threshold
